@@ -1,0 +1,7 @@
+PyMuPDF>=1.23.0
+
+# Typhoon OCR client (remote API)
+typhoon-ocr>=0.1.0
+
+# Progress bar (used by run_typhoon_ocr.py; falls back gracefully if missing)
+tqdm>=4.67.0
