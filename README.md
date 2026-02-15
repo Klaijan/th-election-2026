@@ -4,6 +4,7 @@ This repo contains two things:
 
 - Crop election-form PDFs into a consistent band / region (PyMuPDF)
 - OCR cropped outputs via **Typhoon OCR** (remote API)
+- Multi-page Thai form pipeline to extract handwritten numbers on/above dotted lines and **table column 3 only** (Google Cloud Vision)
 
 ### Setup
 
@@ -92,4 +93,60 @@ python run_typhoon_ocr.py \
   --out-root data/sample/typhoon_md \
   --manifest-jsonl data/sample/typhoon_manifest.jsonl \
   --dry-run
+```
+
+### C) Extract the numbers you care about (post-processing)
+
+This scans Typhoon OCR Markdown and extracts every occurrence of:
+- `จำนวน <n> คน`
+- `จำนวน <n> บัตร`
+
+It keeps the **order** (so you can rely on position) and also captures an optional **schema** prefix (e.g. `2.2.1`) + the **label text** before the number (for foolproofing).
+
+Example (partylist):
+
+```bash
+python extract_typhoon_counts.py \
+  --md-root data/sample/typhoon_md \
+  --out-jsonl data/sample/typhoon_counts_partylist.jsonl \
+  --kind partylist
+```
+
+### D) Multi-page Thai form OCR (Google Cloud Vision) — dotted lines + table column 3 only
+
+This is the **production-style pipeline** described in the prompt (`vote69_form_ocr/` package). It:
+
+- Converts a multi-page PDF to images (default **400 DPI**)
+- Detects dotted lines in the fields zone (page 1)
+- Detects zone-1 y-range on page 1 using `template_4.png` (top anchor) and `template_5.png` (bottom anchor), then searches for dotted lines inside that band.
+- Detects table grids and extracts **only the last column** across continuation pages
+- Batches all crops into **one** OCR call (Google Cloud Vision)
+- Validates outputs and produces a review queue
+
+#### System dependencies
+
+- **Poppler** (needed by `pdf2image`)
+  - macOS: `brew install poppler`
+- (Optional) **Tesseract** (fallback OCR)
+  - macOS: `brew install tesseract`
+
+#### Google credentials
+
+Set `GOOGLE_APPLICATION_CREDENTIALS=/path/to/service-account.json` in your environment.
+
+#### Run
+
+```bash
+python main.py --input data/sample/district --out output --debug
+```
+
+Outputs:
+
+- `output/result.json`
+- `output/debug_output/` (zones, dotted-line overlays, sample crops, OCR+timing JSON)
+
+#### Tests
+
+```bash
+pytest -q
 ```

@@ -5,3 +5,19 @@ typhoon-ocr>=0.1.0
 
 # Progress bar (used by run_typhoon_ocr.py; falls back gracefully if missing)
 tqdm>=4.67.0
+
+# OpenCV table extraction
+numpy>=1.26.0
+opencv-python-headless>=4.9.0.80
+
+# --- Multi-page Thai form OCR pipeline (Google Vision) ---
+pdf2image>=1.17.0
+Pillow>=10.4.0
+google-cloud-vision>=3.7.4
+pandas>=2.2.0
+
+# Optional OCR fallback (requires system tesseract binary)
+pytesseract>=0.3.10
+
+# Tests
+pytest>=8.2.0
