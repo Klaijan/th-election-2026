@@ -15,6 +15,7 @@ __pycache__/
 
 # OS / editor
 .DS_Store
+**/.DS_Store
 
 # Large files (keep out of git)
 /data/
