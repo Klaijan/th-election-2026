@@ -87,6 +87,28 @@ def _draw_zone1_fields_band(page_bgr: np.ndarray, fields_zone: Tuple[int, int]) 
     return out
 
 
+def _draw_logo_overlay(page_bgr: np.ndarray, *, bbox: list | tuple, confidence: float) -> np.ndarray:
+    out = page_bgr.copy()
+    try:
+        x, y, w, h = (int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3]))
+    except Exception:
+        return out
+    if w <= 0 or h <= 0:
+        return out
+    cv2.rectangle(out, (x, y), (x + w, y + h), (0, 0, 255), 5)
+    cv2.putText(
+        out,
+        f"LOGO {float(confidence):.2f}",
+        (x, max(30, y - 10)),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        1.0,
+        (0, 0, 255),
+        3,
+        lineType=cv2.LINE_AA,
+    )
+    return out
+
+
 def structure_results(
     field_regions: List[ExtractedRegion],
     table_regions: List[ExtractedRegion],
@@ -125,6 +147,16 @@ def structure_results(
     }
 
 
+def _group_pages_by_document(page_meta: List[Dict[str, Any]]) -> Dict[int, List[Dict[str, Any]]]:
+    docs: Dict[int, List[Dict[str, Any]]] = {}
+    for m in (page_meta or []):
+        did = int(m.get("document_id", 0) or 0)
+        docs.setdefault(did, []).append(m)
+    for did in list(docs.keys()):
+        docs[did] = sorted(docs[did], key=lambda x: int(x.get("page_num", 0)))
+    return docs
+
+
 def process_form(pdf_path: str, output_dir: str = "output", *, debug: bool = False) -> Dict[str, Any]:
     """
     Complete pipeline for multi-page form processing.
@@ -137,170 +169,297 @@ def process_form(pdf_path: str, output_dir: str = "output", *, debug: bool = Fal
 
     timings: Dict[str, float] = {}
 
-    # STEP 1: Load PDF
+    def _write_failure_result(err: str) -> Dict[str, Any]:
+        """
+        Always emit a minimal result.json on failure so the output folder is never empty.
+        """
+        result = {
+            "status": "failed",
+            "error": str(err),
+            "metadata": {
+                "pdf_path": str(pdf_path),
+                "pages": None,
+                "processing_time": None,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "timings": {k: round(float(v), 3) for k, v in timings.items()},
+                "extractions": {"fields": 0, "table_column_3": 0, "total": 0},
+            },
+        }
+        try:
+            save_json(out_root / "result.json", result)
+        except Exception:
+            # Best effort; never mask the real failure.
+            pass
+        return result
+
     try:
-        with Timer("load_pdf") as t:
-            pages = PDFLoader(dpi=int(config.PDF_DPI)).load_pdf(pdf_path)
-        timings["step1_load_pdf_s"] = float(t.dt or 0.0)
-    except PDFPasswordError:
-        return {"error": "PDF is password protected", "status": "failed"}
-    except PDFCorruptedError as e:
-        return {"error": f"PDF file is corrupted: {e}", "status": "failed"}
+        # STEP 1: Load PDF
+        try:
+            with Timer("load_pdf") as t:
+                pages = PDFLoader(dpi=int(config.PDF_DPI)).load_pdf(pdf_path)
+            timings["step1_load_pdf_s"] = float(t.dt or 0.0)
+        except PDFPasswordError:
+            return _write_failure_result("PDF is password protected")
+        except PDFCorruptedError as e:
+            return _write_failure_result(f"PDF file is corrupted: {e}")
 
-    # STEP 2: Classify pages and zones
-    with Timer("zones") as t:
-        zone_detector = ZoneDetector()
-        page_meta = zone_detector.classify_pages(pages)
-    timings["step2_zone_detection_s"] = float(t.dt or 0.0)
+        # STEP 2: Classify pages and zones (multi-document aware)
+        with Timer("zones") as t:
+            zone_detector = ZoneDetector()
+            try:
+                page_meta = zone_detector.classify_pages_with_logo_detection(pages)
+            except Exception as e:
+                log.warning("Logo-based page classification failed (%s). Falling back to single-document zoning.", str(e))
+                page_meta = zone_detector.classify_pages(pages)
+                # add minimal multi-doc fields for downstream grouping
+                for m in page_meta:
+                    m["is_first_page"] = bool(int(m.get("page_num", 0)) == 0)
+                    m["document_id"] = 0
+                    m["logo_detected"] = False
+                    m["logo_confidence"] = 0.0
+        timings["step2_zone_detection_s"] = float(t.dt or 0.0)
 
-    if debug_root is not None:
-        for m, img in zip(page_meta, pages):
-            p = int(m["page_num"]) + 1
-            save_image(debug_root / f"page_{p:02d}_original.jpg", img)
-            save_image(debug_root / f"page_{p:02d}_zones_marked.jpg", _draw_zones(img, m["zones"]))
-            if p == 1:
-                # Always write zone-1 template debug, even if there are no hits.
-                z1 = m.get("zone1_template_search") or {}
-                search_y = int(z1.get("y_end") or img.shape[0])
-                search_x = int(z1.get("x_end") or img.shape[1])
-                search_y = max(1, min(search_y, int(img.shape[0])))
-                search_x = max(1, min(search_x, int(img.shape[1])))
-                search_zone = (0, int(search_y))
+        if debug_root is not None:
+            # Precompute doc-local page index for filename scheme.
+            doc_pages_sorted: dict[int, list[int]] = {}
+            for m in page_meta:
+                did = int(m.get("document_id", 0) or 0)
+                doc_pages_sorted.setdefault(did, []).append(int(m.get("page_num", 0) or 0))
+            for did in list(doc_pages_sorted.keys()):
+                doc_pages_sorted[did] = sorted(doc_pages_sorted[did])
+
+            for m, img in zip(page_meta, pages):
+                p = int(m["page_num"]) + 1
+                save_image(debug_root / f"page_{p:02d}_original.jpg", img)
+                save_image(debug_root / f"page_{p:02d}_zones_marked.jpg", _draw_zones(img, m["zones"]))
+
+                # Save logo overlay (requested), using multi-doc filename scheme:
+                # page_{global}_doc_{doc}_page_{doc_local}
+                did0 = int(m.get("document_id", 0) or 0)
+                doc_list = doc_pages_sorted.get(did0) or []
+                try:
+                    doc_local = int(doc_list.index(int(m.get("page_num", 0) or 0)) + 1)
+                except Exception:
+                    doc_local = 1
+                logo_fn = f"page_{p}_doc_{did0+1}_page_{doc_local}_logo.jpg"
                 save_image(
-                    debug_root / "page_01_zone1_templates_detected.jpg",
-                    zone_detector.visualize_zone1_template_hits(img, m.get("zone1_template_hits") or [], search_zone, search_x),
+                    debug_root / logo_fn,
+                    _draw_logo_overlay(
+                        img,
+                        bbox=m.get("logo_bbox") or (0, 0, 0, 0),
+                        confidence=float(m.get("logo_confidence", 0.0) or 0.0),
+                    ),
                 )
-                save_image(
-                    debug_root / "page_01_zone1_fields_zone.jpg",
-                    _draw_zone1_fields_band(img, m["zones"]["fields"]),
-                )
-
-    # STEP 3: PARALLEL extraction (fields + tables)
-    def _extract_fields() -> tuple[List[ExtractedRegion], float]:
-        if not (page_meta and page_meta[0].get("has_fields", False)):
-            return ([], 0.0)
-        with Timer("fields") as t_fields:
-            field_extractor = FieldExtractor(remove_dots=True)
-            field_zone = page_meta[0]["zones"]["fields"]
-
-            regs = field_extractor.extract_fields(pages[0], field_zone, debug=debug)
-
-            if debug_root is not None:
-                dot_det = DotDetector()
-                dotted = dot_det.detect_dotted_lines(pages[0], field_zone)
-                save_image(
-                    debug_root / "page_01_dots_detected.jpg",
-                    dot_det.visualize_detection(pages[0], dotted, field_zone),
-                )
-                for r in regs:
-                    save_image(debug_root / f"{r.region_id}_raw.jpg", r.raw_image)
-                    save_image(debug_root / f"{r.region_id}_preprocessed.jpg", r.image)
-        return (regs, float(t_fields.dt or 0.0))
-
-    def _extract_tables() -> tuple[List[ExtractedRegion], float]:
-        with Timer("tables") as t_tables:
-            table_detector = TableDetector()
-            table_extractor = TableExtractor(remove_grid=True)
-
-            target_col: Optional[Tuple[int, int]] = None
-            target_col_idx0: Optional[int] = None
-            row_offset = 0
-            regs: List[ExtractedRegion] = []
-
-            for i, (meta, img) in enumerate(zip(page_meta, pages)):
-                if not meta.get("has_table", False):
-                    continue
-                zone = meta["zones"]["table"]
-                bbox = table_detector.detect_table_boundary(img, zone)
-                struct = table_detector.parse_table_structure(img, bbox)
-
-                if i == 0:
-                    target_col = struct.target_column
-                    target_col_idx0 = int(struct.target_column_index)
-                elif target_col is not None and target_col_idx0 is not None:
-                    # reuse from page 1 for robust continuation (last column alignment)
-                    struct = TableStructure(
-                        bbox=struct.bbox,
-                        grid_horizontal=struct.grid_horizontal,
-                        grid_vertical=struct.grid_vertical,
-                        target_column=target_col,
-                        target_column_index=int(target_col_idx0),
-                        rows=struct.rows,
-                        cols=struct.cols,
+                if bool(m.get("is_first_page", p == 1)):
+                    # Always write zone-1 template debug on first pages (one per document), even if there are no hits.
+                    z1 = m.get("zone1_template_search") or {}
+                    search_y = int(z1.get("y_end") or img.shape[0])
+                    search_x = int(z1.get("x_end") or img.shape[1])
+                    search_y = max(1, min(search_y, int(img.shape[0])))
+                    search_x = max(1, min(search_x, int(img.shape[1])))
+                    search_zone = (0, int(search_y))
+                    save_image(
+                        debug_root / f"page_{p:02d}_zone1_templates_detected.jpg",
+                        zone_detector.visualize_zone1_template_hits(
+                            img, m.get("zone1_template_hits") or [], search_zone, search_x
+                        ),
+                    )
+                    save_image(
+                        debug_root / f"page_{p:02d}_zone1_fields_zone.jpg",
+                        _draw_zone1_fields_band(img, m["zones"]["fields"]),
                     )
 
-                page_cells = table_extractor.extract_target_column_cells(
-                    img, struct, i, row_offset=row_offset, skip_header_rows=1
+        # STEP 3: Extraction (multi-document)
+        docs = _group_pages_by_document(page_meta)
+        doc_results_meta: List[Dict[str, Any]] = []
+        field_regions: List[ExtractedRegion] = []
+        table_regions: List[ExtractedRegion] = []
+
+        with Timer("extract_all_documents") as t_extract:
+            for did, doc_pages in sorted(docs.items(), key=lambda kv: int(kv[0])):
+                first_pages = [m for m in doc_pages if bool(m.get("is_first_page", False))]
+                if not first_pages:
+                    # Should not happen (page 0 forced), but be safe.
+                    first_pages = [doc_pages[0]]
+                first_meta = first_pages[0]
+                first_idx = int(first_meta.get("page_num", 0))
+
+                log.info("Processing document %d: pages=%s first_page=%d", int(did), [int(m["page_num"]) + 1 for m in doc_pages], first_idx + 1)
+
+                # Fields (only on first page)
+                doc_field_regions: List[ExtractedRegion] = []
+                if bool(first_meta.get("has_fields", False)):
+                    field_zone = first_meta["zones"]["fields"]
+                    prefix = f"doc{int(did)}_p{int(first_idx)+1}_"
+                    fe = FieldExtractor(remove_dots=True)
+                    doc_field_regions = fe.extract_fields(pages[first_idx], field_zone, debug=debug, region_id_prefix=prefix)
+                    field_regions.extend(doc_field_regions)
+
+                    if debug_root is not None:
+                        dot_det = DotDetector()
+                        dotted = dot_det.detect_dotted_lines(pages[first_idx], field_zone)
+                        save_image(
+                            debug_root / f"page_{int(first_idx)+1:02d}_dots_detected.jpg",
+                            dot_det.visualize_detection(pages[first_idx], dotted, field_zone),
+                        )
+                        for r in doc_field_regions:
+                            save_image(debug_root / f"{r.region_id}_raw.jpg", r.raw_image)
+                            save_image(debug_root / f"{r.region_id}_preprocessed.jpg", r.image)
+
+                # Tables (all pages in doc)
+                td = TableDetector()
+                te = TableExtractor(remove_grid=True)
+                target_col: Optional[Tuple[int, int]] = None
+                target_col_idx0: Optional[int] = None
+                row_offset = 0
+                doc_table_regions: List[ExtractedRegion] = []
+
+                for m in doc_pages:
+                    page_num = int(m.get("page_num", 0))
+                    if not bool(m.get("has_table", False)):
+                        continue
+                    img = pages[page_num]
+                    zone = m["zones"]["table"]
+                    bbox = td.detect_table_boundary(img, zone)
+                    struct = td.parse_table_structure(img, bbox)
+
+                    if bool(m.get("is_first_page", False)):
+                        target_col = struct.target_column
+                        target_col_idx0 = int(struct.target_column_index)
+                    elif target_col is not None and target_col_idx0 is not None:
+                        struct = TableStructure(
+                            bbox=struct.bbox,
+                            grid_horizontal=struct.grid_horizontal,
+                            grid_vertical=struct.grid_vertical,
+                            target_column=target_col,
+                            target_column_index=int(target_col_idx0),
+                            rows=struct.rows,
+                            cols=struct.cols,
+                        )
+
+                    page_cells = te.extract_target_column_cells(img, struct, page_num, row_offset=row_offset, skip_header_rows=1)
+                    doc_table_regions.extend(page_cells)
+                    row_offset += len(page_cells)
+
+                    if debug_root is not None and page_cells:
+                        overlay = img.copy()
+                        x0, x1 = struct.target_column
+                        cv2.rectangle(overlay, (int(x0), int(struct.bbox.y)), (int(x1), int(struct.bbox.y2)), (0, 255, 0), 6)
+                        save_image(debug_root / f"page_{page_num+1:02d}_last_column_highlighted.jpg", overlay)
+                        for r in page_cells[:12]:
+                            save_image(debug_root / f"{r.region_id}_raw.jpg", r.raw_image)
+                            save_image(debug_root / f"{r.region_id}_preprocessed.jpg", r.image)
+
+                table_regions.extend(doc_table_regions)
+
+                doc_results_meta.append(
+                    {
+                        "document_id": int(did),
+                        "pages": [int(m["page_num"]) for m in doc_pages],
+                        "first_page": int(first_idx),
+                        "logo_detected": bool(first_meta.get("logo_detected", False)),
+                        "logo_confidence": float(first_meta.get("logo_confidence", 0.0) or 0.0),
+                        "extractions": {"fields": int(len(doc_field_regions)), "table_column_3": int(len(doc_table_regions))},
+                    }
                 )
-                regs.extend(page_cells)
-                row_offset += len(page_cells)
 
-                if debug_root is not None:
-                    # highlight column 3
-                    overlay = img.copy()
-                    x0, x1 = struct.target_column
-                    cv2.rectangle(
-                        overlay,
-                        (int(x0), int(struct.bbox.y)),
-                        (int(x1), int(struct.bbox.y2)),
-                        (0, 255, 0),
-                        6,
-                    )
-                    save_image(debug_root / f"page_{i+1:02d}_last_column_highlighted.jpg", overlay)
-                    for r in page_cells[:12]:
-                        save_image(debug_root / f"{r.region_id}_raw.jpg", r.raw_image)
-                        save_image(debug_root / f"{r.region_id}_preprocessed.jpg", r.image)
+        timings["step3_extract_all_documents_s"] = float(t_extract.dt or 0.0)
 
-        return (regs, float(t_tables.dt or 0.0))
+        # STEP 4: Batch OCR
+        with Timer("ocr") as t:
+            all_regions = field_regions + table_regions
+            images = [r.image for r in all_regions]
+            ids = [r.region_id for r in all_regions]
+            ocr = OCRProcessor(provider=config.OCR_PROVIDER, languages=config.OCR_LANGUAGES)
+            ocr_results = ocr.batch_ocr(images, ids)
+        timings["step4_batch_ocr_s"] = float(t.dt or 0.0)
 
-    with ThreadPoolExecutor(max_workers=2) as ex:
-        fut_fields = ex.submit(_extract_fields)
-        fut_tables = ex.submit(_extract_tables)
-        field_regions, dt_fields = fut_fields.result()
-        table_regions, dt_tables = fut_tables.result()
+        # STEP 5: Structure + validate (per-document)
+        with Timer("validate") as t:
+            docs = _group_pages_by_document(page_meta)
+            validator = Validator()
+            documents_out: List[Dict[str, Any]] = []
 
-    timings["step3a_fields_extraction_s"] = float(dt_fields)
-    timings["step3b_table_extraction_s"] = float(dt_tables)
+            # Build fast lookups by page for region assignment
+            fields_by_doc: Dict[int, List[ExtractedRegion]] = {}
+            for r in field_regions:
+                # region_id prefix encodes doc id as "doc{did}_..."
+                did = 0
+                if r.region_id.startswith("doc"):
+                    try:
+                        did = int(r.region_id.split("_", 1)[0].replace("doc", ""))
+                    except Exception:
+                        did = 0
+                fields_by_doc.setdefault(did, []).append(r)
 
-    # STEP 4: Batch OCR
-    with Timer("ocr") as t:
-        all_regions = field_regions + table_regions
-        images = [r.image for r in all_regions]
-        ids = [r.region_id for r in all_regions]
-        ocr = OCRProcessor(provider=config.OCR_PROVIDER, languages=config.OCR_LANGUAGES)
-        ocr_results = ocr.batch_ocr(images, ids)
-    timings["step4_batch_ocr_s"] = float(t.dt or 0.0)
+            tables_by_doc: Dict[int, List[ExtractedRegion]] = {}
+            for did, doc_pages in docs.items():
+                page_nums = {int(m["page_num"]) for m in doc_pages}
+                tables_by_doc[int(did)] = [r for r in table_regions if int((r.meta.get("page", 0) or 0)) - 1 in page_nums]
 
-    # STEP 5: Structure + validate
-    with Timer("validate") as t:
-        structured = structure_results(field_regions, table_regions, ocr_results)
-        validator = Validator()
-        validated = validator.validate_results(structured)
-    timings["step5_validation_s"] = float(t.dt or 0.0)
+            for did, doc_pages in sorted(docs.items(), key=lambda kv: int(kv[0])):
+                first_pages = [m for m in doc_pages if bool(m.get("is_first_page", False))]
+                first_idx = int((first_pages[0] if first_pages else doc_pages[0]).get("page_num", 0))
+                f_regs = fields_by_doc.get(int(did), [])
+                t_regs = tables_by_doc.get(int(did), [])
 
-    total_s = float(sum(timings.values()))
-    result = {
-        "metadata": {
-            "pdf_path": str(pdf_path),
-            "pages": int(len(pages)),
-            "processing_time": round(total_s, 3),
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "timings": {k: round(float(v), 3) for k, v in timings.items()},
-            "extractions": {"fields": len(field_regions), "table_column_3": len(table_regions), "total": len(field_regions) + len(table_regions)},
-        },
-        **validated,
-    }
+                structured_doc = structure_results(f_regs, t_regs, ocr_results)
+                validated_doc = validator.validate_results(structured_doc)
+                documents_out.append(
+                    {
+                        "document_id": int(did),
+                        "pages": [int(m["page_num"]) for m in doc_pages],
+                        "first_page": int(first_idx),
+                        **validated_doc,
+                    }
+                )
 
-    save_json(out_root / "result.json", result)
-    if debug_root is not None:
-        save_json(debug_root / "timing_breakdown.json", timings)
-        save_json(debug_root / "ocr_results.json", {k: v.__dict__ for k, v in ocr_results.items()})
+        timings["step5_validation_s"] = float(t.dt or 0.0)
 
-    log.info("Step 1: Loaded %d pages (%.3fs)", len(pages), timings.get("step1_load_pdf_s", 0.0))
-    log.info("Step 3A: Extracted %d fields (%.3fs)", len(field_regions), timings.get("step3a_fields_extraction_s", 0.0))
-    log.info("Step 3B: Extracted %d table cells from column 3 (%.3fs)", len(table_regions), timings.get("step3b_table_extraction_s", 0.0))
-    log.info("Total processing time: %.3fs", total_s)
-    return result
+        total_s = float(sum(timings.values()))
+        result: Dict[str, Any] = {
+            "metadata": {
+                "pdf_path": str(pdf_path),
+                "pages": int(len(pages)),
+                "total_documents": int(len(doc_results_meta) or 1),
+                "processing_time": round(total_s, 3),
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "timings": {k: round(float(v), 3) for k, v in timings.items()},
+                "extractions": {
+                    "fields": len(field_regions),
+                    "table_column_3": len(table_regions),
+                    "total": len(field_regions) + len(table_regions),
+                },
+            },
+            "documents": documents_out,
+            "documents_meta": doc_results_meta,
+        }
+
+        # Backwards compatibility: if we only detected one document, keep legacy top-level keys.
+        if len(documents_out) == 1:
+            for k in ("fields", "table", "validation", "review_queue"):
+                if k in documents_out[0]:
+                    result[k] = documents_out[0][k]
+
+        save_json(out_root / "result.json", result)
+        if debug_root is not None:
+            save_json(debug_root / "timing_breakdown.json", timings)
+            save_json(debug_root / "ocr_results.json", {k: v.__dict__ for k, v in ocr_results.items()})
+
+        log.info("Step 1: Loaded %d pages (%.3fs)", len(pages), timings.get("step1_load_pdf_s", 0.0))
+        log.info(
+            "Step 3: Extracted %d fields + %d table cells across %d document(s) (%.3fs)",
+            len(field_regions),
+            len(table_regions),
+            int(len(doc_results_meta) or 1),
+            timings.get("step3_extract_all_documents_s", 0.0),
+        )
+        log.info("Total processing time: %.3fs", total_s)
+        return result
+    except Exception as e:
+        # Best-effort: write a failure result.json, then re-raise so batch mode records status=error.
+        _write_failure_result(str(e))
+        raise
 
 
 def process_inputs(
@@ -346,16 +505,22 @@ def process_inputs(
 
         try:
             r = process_form(str(p), str(out_dir), debug=bool(debug))
-            rows.append(
-                {
-                    "pdf": str(p),
-                    "out_dir": str(out_dir),
-                    "status": "ok",
-                    "pages": r.get("metadata", {}).get("pages", None),
-                    "processing_time": r.get("metadata", {}).get("processing_time", None),
-                }
-            )
-            processed += 1
+            # process_form can return a structured failure dict (status="failed") without throwing.
+            status = str(r.get("status") or "ok")
+            row = {
+                "pdf": str(p),
+                "out_dir": str(out_dir),
+                "status": status,
+                "pages": r.get("metadata", {}).get("pages", None) if isinstance(r, dict) else None,
+                "processing_time": r.get("metadata", {}).get("processing_time", None) if isinstance(r, dict) else None,
+            }
+            if status != "ok":
+                row["error"] = r.get("error", None) if isinstance(r, dict) else None
+                rows.append(row)
+                failed += 1
+            else:
+                rows.append(row)
+                processed += 1
         except Exception as e:
             failed += 1
             rows.append({"pdf": str(p), "out_dir": str(out_dir), "status": "error", "error": str(e)})

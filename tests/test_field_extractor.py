@@ -1,7 +1,7 @@
 import numpy as np
 
-from vote69_form_ocr.field_extractor import FieldExtractor
-from vote69_form_ocr.types import DottedLine
+from extract_handwritten_numbers.field_extractor import FieldExtractor
+from extract_handwritten_numbers.types import DottedLine
 
 
 def test_bbox_calculation_and_clamping():

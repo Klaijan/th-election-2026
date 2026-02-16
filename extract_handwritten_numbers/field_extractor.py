@@ -22,19 +22,29 @@ class FieldExtractor:
         self.remove_dots = bool(remove_dots)
         self.dot_detector = DotDetector()
 
-    def extract_fields(self, image: np.ndarray, zone: Tuple[int, int], *, debug: bool = False) -> List[ExtractedRegion]:
+    def extract_fields(
+        self,
+        image: np.ndarray,
+        zone: Tuple[int, int],
+        *,
+        debug: bool = False,
+        region_id_prefix: str = "",
+    ) -> List[ExtractedRegion]:
         dotted_lines = self.dot_detector.detect_dotted_lines(image, zone)
         if debug:
             log.info("Detected %d dotted line(s) in zone-1 fields range", len(dotted_lines))
-        return self.extract_field_regions(image, dotted_lines)
+        return self.extract_field_regions(image, dotted_lines, region_id_prefix=str(region_id_prefix or ""))
 
     # Backwards-compat alias (older code/tests may still call this).
-    def extract_from_zone(self, image: np.ndarray, zone: Tuple[int, int], *, debug: bool = False) -> List[ExtractedRegion]:
-        return self.extract_fields(image, zone, debug=debug)
+    def extract_from_zone(
+        self, image: np.ndarray, zone: Tuple[int, int], *, debug: bool = False, region_id_prefix: str = ""
+    ) -> List[ExtractedRegion]:
+        return self.extract_fields(image, zone, debug=debug, region_id_prefix=str(region_id_prefix or ""))
 
-    def extract_field_regions(self, image: np.ndarray, dotted_lines: List[Any]) -> List[ExtractedRegion]:
+    def extract_field_regions(self, image: np.ndarray, dotted_lines: List[Any], region_id_prefix: str = "") -> List[ExtractedRegion]:
         h, w = image.shape[:2]
         out: List[ExtractedRegion] = []
+        prefix = str(region_id_prefix or "")
 
         for i, dl_any in enumerate(dotted_lines):
             dl: Dict[str, Any]
@@ -73,7 +83,7 @@ class FieldExtractor:
 
             out.append(
                 ExtractedRegion(
-                    region_id=f"field_{i+1}",
+                    region_id=f"{prefix}field_{i+1}",
                     bbox=box,
                     image=pre,
                     raw_image=raw,

@@ -114,7 +114,7 @@ python extract_typhoon_counts.py \
 
 ### D) Multi-page Thai form OCR (Google Cloud Vision) — dotted lines + table column 3 only
 
-This is the **production-style pipeline** described in the prompt (`vote69_form_ocr/` package). It:
+This is the **production-style pipeline** described in the prompt (`extract_handwritten_numbers/` package). It:
 
 - Converts a multi-page PDF to images (default **400 DPI**)
 - Detects dotted lines in the fields zone (page 1)

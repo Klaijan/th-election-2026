@@ -1,12 +1,12 @@
 import numpy as np
 import cv2
 
-from vote69_form_ocr import config
-from vote69_form_ocr.dot_detector import DotDetector
-from vote69_form_ocr.field_extractor import FieldExtractor
-from vote69_form_ocr.table_detector import TableDetector
-from vote69_form_ocr.table_extractor import TableExtractor
-from vote69_form_ocr.types import Box, TableStructure
+from extract_handwritten_numbers import config
+from extract_handwritten_numbers.dot_detector import DotDetector
+from extract_handwritten_numbers.field_extractor import FieldExtractor
+from extract_handwritten_numbers.table_detector import TableDetector
+from extract_handwritten_numbers.table_extractor import TableExtractor
+from extract_handwritten_numbers.types import Box, TableStructure
 
 
 def _draw_dotted_line(img, y, x0, x1, step=12, r=2):

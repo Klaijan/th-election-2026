@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from vote69_form_ocr.main import _out_dir_for_input
+from extract_handwritten_numbers.main import _out_dir_for_input
 
 
 def test_out_dir_mirrors_input_structure():

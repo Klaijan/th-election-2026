@@ -1,7 +1,7 @@
 import numpy as np
 import cv2
 
-from vote69_form_ocr.dot_detector import DotDetector
+from extract_handwritten_numbers.dot_detector import DotDetector
 
 
 def _make_dotted_line_image(w=600, h=300, y=120, x0=60, x1=520, step=12, r=2, missing_every=0):

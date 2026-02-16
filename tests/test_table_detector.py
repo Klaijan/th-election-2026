@@ -1,8 +1,8 @@
 import numpy as np
 import cv2
 
-from vote69_form_ocr.table_detector import TableDetector
-from vote69_form_ocr.types import Box
+from extract_handwritten_numbers.table_detector import TableDetector
+from extract_handwritten_numbers.types import Box
 
 
 def _make_grid(w=600, h=400, cols=5, rows=6, margin=20, thickness=3):

@@ -22,11 +22,23 @@ TABLE_ZONE = (0.50, 1.0)  # table start and continuation
 # Zone 1 (fields) y-range templates (page 1)
 # -------------------------
 ZONE1_TEMPLATE_FILES: tuple[str, str] = ("template_4.png", "template_5.png")
-ZONE1_TEMPLATE_THRESHOLD: float = 0.75
+ZONE1_TEMPLATE_THRESHOLD: float = 0.60
 ZONE1_TEMPLATE_SCALES: tuple[float, float, float] = (0.90, 1.00, 1.10)
 ZONE1_TEMPLATE_PAD_PX: int = 80
 ZONE1_TEMPLATE_SEARCH_X_FRAC: float = 0.5  # search left 50% of the page (templates 4/5 appear on left half)
 ZONE1_TEMPLATE_SEARCH_Y_FRAC: float = 0.65  # search top 65% of the page
+
+# -------------------------
+# Region templates (fields zone for first pages with logo)
+# -------------------------
+# These anchors define the top/bottom of the "fields" region on first pages.
+REGION_TEMPLATE_FILES_1: tuple[str, str] = ("region_begin.png", "region_end.png")
+REGION_TEMPLATE_FILES_2: tuple[str, str] = ("region_begin_2.png", "region_end_2.png")
+REGION_TEMPLATE_THRESHOLD: float = 0.70
+REGION_TEMPLATE_SCALES: tuple[float, ...] = (0.80, 0.90, 1.00, 1.10, 1.20)
+REGION_TEMPLATE_PAD_PX: int = 60
+REGION_TEMPLATE_SEARCH_Y_FRAC: float = 0.65  # search top 65% of the page
+REGION_TEMPLATE_SEARCH_X_FRAC: float = 1.0   # search full width by default
 
 # -------------------------
 # Dot detection
@@ -81,5 +93,26 @@ TABLE_VALUE_RANGE = (0, 1_000)
 # Debugging
 # -------------------------
 DEBUG_SAVE_INTERMEDIATES: bool = False
+
+# -------------------------
+# Logo detection (multi-document PDFs)
+# -------------------------
+# Place a grayscale PNG template under extract_handwritten_numbers/templates/
+LOGO_TEMPLATE_FILE: str = "logo.png"
+# Detect logo only in top band of the page (fraction of height)
+LOGO_SEARCH_Y_FRAC: float = 0.20
+# Template match threshold (TM_CCOEFF_NORMED)
+LOGO_DETECTION_THRESHOLD: float = 0.70
+# Multi-scale matching (±20% size variation)
+# NOTE: In practice, template DPI/cropping can differ from rendered page DPI.
+# Keep a wider scale sweep so we can still detect the crest logo reliably.
+LOGO_SCALES: tuple[float, ...] = (0.80, 0.90, 1.00, 1.10, 1.20, 1.30, 1.40, 1.50, 1.60, 1.75, 1.90, 2.00)
+
+# Only enable logo-based multi-document split for PDFs with at least this many pages.
+MIN_PAGES_FOR_LOGO_DETECTION: int = 3
+# Always treat page 0 as a first page (safety).
+ALWAYS_TREAT_PAGE0_AS_FIRST: bool = True
+# If two detected logos are too close, treat the later one as suspicious (helps false positives).
+LOGO_MIN_PAGE_GAP: int = 1
 
 

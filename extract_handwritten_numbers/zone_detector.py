@@ -8,6 +8,7 @@ import cv2
 import numpy as np
 
 from . import config
+from .logo_detector import LogoDetector
 
 log = logging.getLogger("extract_handwritten_numbers")
 
@@ -35,6 +36,10 @@ class ZoneDetector:
         return (y0, y1)
 
     def classify_pages(self, pages: List[np.ndarray]) -> List[Dict]:
+        """
+        Backwards-compatible single-document classification.
+        For multi-document PDFs, use `classify_pages_with_logo_detection()`.
+        """
         out: List[Dict] = []
         for i, page in enumerate(pages):
             h, w = page.shape[:2]
@@ -82,6 +87,129 @@ class ZoneDetector:
             )
         return out
 
+    def classify_pages_with_logo_detection(self, pages: List[np.ndarray]) -> List[Dict]:
+        """
+        Multi-document classification:
+        - Detect logo in top band to identify first pages (starts of new forms).
+        - Assign document_id by splitting at detected first pages.
+        """
+        if not pages:
+            return []
+
+        use_logo = len(pages) >= int(getattr(config, "MIN_PAGES_FOR_LOGO_DETECTION", 3))
+        logo = LogoDetector()
+
+        min_gap = int(getattr(config, "LOGO_MIN_PAGE_GAP", 1))
+        always_page0 = bool(getattr(config, "ALWAYS_TREAT_PAGE0_AS_FIRST", True))
+
+        doc_id = 0
+        last_first_page = -10_000
+        out: List[Dict] = []
+
+        for i, page in enumerate(pages):
+            h, w = page.shape[:2]
+
+            hit = {"has_logo": False, "confidence": 0.0, "position": (0, 0), "bbox": (0, 0, 0, 0), "scale": 1.0}
+            if use_logo:
+                try:
+                    hit = logo.detect_logo(page)
+                except Exception as e:
+                    log.warning("Logo detection failed on page %d (%s). Continuing without logo for this page.", i + 1, str(e))
+                    hit = {"has_logo": False, "confidence": 0.0, "position": (0, 0), "bbox": (0, 0, 0, 0), "scale": 1.0}
+
+            is_first_page = bool(hit.get("has_logo", False))
+            if i == 0 and always_page0:
+                if not is_first_page and use_logo:
+                    log.warning("Logo not detected on page 1, but treating page 1 as first page (ALWAYS_TREAT_PAGE0_AS_FIRST).")
+                is_first_page = True
+
+            # Debounce: avoid splitting if logos are detected too close together (likely false positives).
+            if i > 0 and is_first_page and (i - last_first_page) <= int(min_gap):
+                log.warning(
+                    "Logo detected too close to previous first page (page %d and %d). Treating page %d as continuation (likely false positive).",
+                    last_first_page + 1,
+                    i + 1,
+                    i + 1,
+                )
+                is_first_page = False
+
+            if i > 0 and is_first_page:
+                doc_id += 1
+                last_first_page = i
+            elif i == 0 and is_first_page:
+                last_first_page = i
+
+            if is_first_page:
+                header_y1 = int(round(float(h) * float(getattr(config, "LOGO_SEARCH_Y_FRAC", 0.20))))
+                header_y1 = max(1, min(header_y1, h))
+                header = (0, int(header_y1))
+                table = self._zone_px(h, config.TABLE_ZONE)
+                y_end = int(
+                    round(float(h) * float(getattr(config, "REGION_TEMPLATE_SEARCH_Y_FRAC", getattr(config, "ZONE1_TEMPLATE_SEARCH_Y_FRAC", 0.65))))
+                )
+                y_end = max(1, min(y_end, h))
+                x_end = int(
+                    round(float(w) * float(getattr(config, "REGION_TEMPLATE_SEARCH_X_FRAC", getattr(config, "ZONE1_TEMPLATE_SEARCH_X_FRAC", 0.5))))
+                )
+                x_end = max(1, min(x_end, w))
+                region_status: dict = {"status": "skipped"}
+                # Requirement: for pages where logo is detected, infer fields zone from region_begin/region_end templates.
+                # If rejected, fall back to region_begin_2/region_end_2. If none, keep status+filenames in metadata.
+                if bool(hit.get("has_logo", False)):
+                    fields, zone1_hits, region_status = self._infer_fields_zone_from_region_templates(
+                        page, search_zone=(0, int(y_end)), search_x_end=int(x_end)
+                    )
+                else:
+                    fields, zone1_hits = self._infer_fields_zone_from_zone1_templates(
+                        page, search_zone=(0, int(y_end)), search_x_end=int(x_end)
+                    )
+                if fields == (0, 0):
+                    fields = (0, int(y_end))
+                    zone1_hits = []
+            else:
+                header = (0, 0)
+                fields = (0, 0)
+                table = (0, h)
+                zone1_hits = []
+                x_end = 0
+                y_end = 0
+                region_status = {"status": "n/a"}
+
+            has_table = self._has_table_grid(page, table)
+            has_fields = bool(is_first_page)
+
+            out.append(
+                {
+                    "page_num": i,
+                    "is_first_page": bool(is_first_page),
+                    "document_id": int(doc_id),
+                    "logo_detected": bool(hit.get("has_logo", False)),
+                    "logo_confidence": float(hit.get("confidence", 0.0) or 0.0),
+                    "logo_bbox": list(hit.get("bbox", (0, 0, 0, 0))),
+                    "zones": {"header": header, "fields": fields, "table": table},
+                    "has_fields": bool(has_fields),
+                    "has_table": bool(has_table),
+                    "page_size": (w, h),
+                    "zone1_template_hits": zone1_hits,
+                    "zone1_template_search": {"x_end": int(x_end), "y_end": int(y_end)},
+                    "region_templates": region_status,
+                }
+            )
+
+        # Sanity warnings for false positives / misconfigurations.
+        first_pages = [m for m in out if m.get("is_first_page")]
+        if use_logo and len(pages) >= 3:
+            if len(first_pages) == 1 and not bool(first_pages[0].get("logo_detected", False)) and len(pages) >= 3:
+                log.warning("No logos detected in multi-page PDF; treating as single document (page 1 forced as first).")
+            if len(first_pages) > int(len(pages) * 0.5):
+                log.warning(
+                    "Suspicious: %d/%d pages marked as first pages (>50%%). Logo template may be too generic; consider increasing LOGO_DETECTION_THRESHOLD.",
+                    len(first_pages),
+                    len(pages),
+                )
+
+        return out
+
     def _infer_fields_zone_from_zone1_templates(
         self, page_bgr: np.ndarray, *, search_zone: Tuple[int, int], search_x_end: int
     ) -> tuple[Tuple[int, int], list[dict]]:
@@ -121,7 +249,7 @@ class ZoneDetector:
                 self._logged_zone1_template_fallback = True
             return (0, 0), []
 
-        thr = float(getattr(config, "ZONE1_TEMPLATE_THRESHOLD", 0.75))
+        thr = float(getattr(config, "ZONE1_TEMPLATE_THRESHOLD", 0.6))
         scales = list(getattr(config, "ZONE1_TEMPLATE_SCALES", (0.90, 1.00, 1.10)))
 
         hit4 = self._best_template_hit(gray, t4, template_file=str(fn4), scales=scales, thr=thr)
@@ -158,6 +286,98 @@ class ZoneDetector:
 
         hits = [hit4, hit5]
         return (int(yy0), int(yy1)), hits
+
+    def _infer_fields_zone_from_region_templates(
+        self, page_bgr: np.ndarray, *, search_zone: Tuple[int, int], search_x_end: int
+    ) -> tuple[Tuple[int, int], list[dict], dict]:
+        """
+        For logo-detected first pages: infer fields y-range using region begin/end anchors.
+
+        Try in order:
+        - set1: REGION_TEMPLATE_FILES_1 = (region_begin, region_end)
+        - if rejected/not found: set2: REGION_TEMPLATE_FILES_2 = (region_begin_2, region_end_2)
+
+        Returns:
+        - (y0,y1) absolute pixels or (0,0) when unavailable/not matched
+        - hits list (ROI-relative bboxes, same format as zone-1 hits) for debug overlays
+        - status dict that includes which filenames were tried and why
+        """
+        y0, y1 = int(search_zone[0]), int(search_zone[1])
+        h, w = page_bgr.shape[:2]
+        y0 = max(0, min(y0, h))
+        y1 = max(0, min(y1, h))
+        if y1 <= y0:
+            return (0, 0), [], {"status": "invalid_search_zone"}
+
+        xw = max(1, min(int(search_x_end), int(w)))
+        roi = page_bgr[y0:y1, 0:xw]
+        if roi.size == 0:
+            return (0, 0), [], {"status": "empty_roi"}
+
+        gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+        templates_dir = (Path(__file__).resolve().parent / "templates")
+
+        thr = float(getattr(config, "REGION_TEMPLATE_THRESHOLD", 0.70))
+        scales = list(getattr(config, "REGION_TEMPLATE_SCALES", (0.80, 0.90, 1.00, 1.10, 1.20)))
+        pad = int(getattr(config, "REGION_TEMPLATE_PAD_PX", 60))
+
+        files1 = tuple(getattr(config, "REGION_TEMPLATE_FILES_1", ("region_begin.png", "region_end.png")))
+        files2 = tuple(getattr(config, "REGION_TEMPLATE_FILES_2", ("region_begin_2.png", "region_end_2.png")))
+
+        tried: list[dict] = []
+
+        def _load_gray(fn: str) -> np.ndarray | None:
+            t = cv2.imread(str(templates_dir / fn), cv2.IMREAD_GRAYSCALE)
+            if t is None or t.size == 0:
+                return None
+            return t
+
+        def _try_pair(pair: tuple[str, str], *, tag: str) -> tuple[Tuple[int, int], list[dict]] | None:
+            fn_begin, fn_end = str(pair[0]), str(pair[1])
+            t_begin = _load_gray(fn_begin)
+            t_end = _load_gray(fn_end)
+            entry: dict = {"tag": str(tag), "files": [fn_begin, fn_end], "loaded": [t_begin is not None, t_end is not None]}
+            tried.append(entry)
+            if t_begin is None or t_end is None:
+                entry["reason"] = "template_missing"
+                return None
+
+            hit_b = self._best_template_hit(gray, t_begin, template_file=str(fn_begin), scales=scales, thr=thr)
+            hit_e = self._best_template_hit(gray, t_end, template_file=str(fn_end), scales=scales, thr=thr)
+            entry["matched"] = [hit_b is not None, hit_e is not None]
+            if hit_b is None or hit_e is None:
+                entry["reason"] = "rejected_or_not_found"
+                return None
+
+            y_begin = int(hit_b["bbox"][1])
+            y_end2 = int(hit_e["bbox"][1] + hit_e["bbox"][3])
+            if y_end2 <= y_begin:
+                entry["reason"] = "invalid_order"
+                return None
+
+            yy0 = max(y0, y0 + y_begin - pad)
+            yy1 = min(y1, y0 + y_end2 + pad)
+            if yy1 <= yy0:
+                entry["reason"] = "empty_band"
+                return None
+
+            entry["confidence"] = [float(hit_b.get("confidence", 0.0)), float(hit_e.get("confidence", 0.0))]
+            return (int(yy0), int(yy1)), [hit_b, hit_e]
+
+        used: str | None = None
+        got = _try_pair((str(files1[0]), str(files1[1])), tag="set1")
+        if got is not None:
+            used = "set1"
+        else:
+            got = _try_pair((str(files2[0]), str(files2[1])), tag="set2")
+            if got is not None:
+                used = "set2"
+
+        if got is None:
+            return (0, 0), [], {"status": "none", "used": None, "threshold": float(thr), "scales": list(scales), "tried": tried}
+
+        band, hits = got
+        return band, hits, {"status": "ok", "used": used, "threshold": float(thr), "scales": list(scales), "tried": tried}
 
     @staticmethod
     def _best_template_hit(
