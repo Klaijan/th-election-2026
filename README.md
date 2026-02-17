@@ -57,7 +57,8 @@ rclone config
 Create a remote called `ect_drive`.
 
 2. Select province for mirroring
-   For the provinces you want to mirror, enter one province per line in `configs/province.txt`. `configs/province_links.csv` provides the corresponding drive folder URL.
+
+For the provinces you want to mirror, enter one province per line in `configs/province.txt`. `configs/province_links.csv` provides the corresponding drive folder URL.
 
 3. Run the mirroring script
 
