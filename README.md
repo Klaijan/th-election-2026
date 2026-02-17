@@ -1,10 +1,11 @@
 ## Vote69 — Crop PDFs + Typhoon OCR
 
-This repo contains two things:
+This repo currently does four things:
 
-- Crop election-form PDFs into a consistent band / region (PyMuPDF)
-- OCR cropped outputs via **Typhoon OCR** (remote API)
-- Multi-page Thai form pipeline to extract handwritten numbers on/above dotted lines and **table column 3 only** (Google Cloud Vision)
+1. Locally download official ECT google drive for selected provinces (via `.configs/province.txt`)
+2. Crop election-form PDFs into a consistent band / region (PyMuPDF)
+3. OCR cropped outputs via **Typhoon OCR** (remote API)
+4. Multi-page Thai form pipeline to extract handwritten numbers on/above dotted lines and **table column 3 only** (Google Cloud Vision)
 
 ### Setup
 
@@ -42,7 +43,31 @@ Install Python deps:
 python -m pip install -r requirements.txt
 ```
 
-### A) Crop PDFs
+### A) Mirror ECT google drive (download PDFs locally)
+
+Before running OCR, mirror the official ECT Google Drive folders to your local `data/` directory
+
+1. Install rclone prerequisite and configure a Google Drive remote (one-time setup):
+
+```bash
+brew install rclone
+rclone config
+```
+
+Create a remote called `ect_drive`.
+
+2. Select province for mirroring
+   For the provinces you want to mirror, enter one province per line in `configs/province.txt`. `configs/province_links.csv` provides the corresponding drive folder URL.
+
+3. Run the mirroring script
+
+```bash
+bash scripts/sync_selected_from_csv.sh ect_drive
+```
+
+The script will write files under `data/`, and can be re-run as it will only copy missing/changed files depending on flags.
+
+### B) Crop PDFs
 
 Default crop (full width, 30%..60% of page height) into a new 1-page PDF:
 
@@ -56,7 +81,7 @@ Batch crop and keep filenames under `cropped/{district,partylist}/`:
 python batch_crop_pdfs.py --input-dir data/sample --out-root data/sample --crop-script crop_pdf_page.py
 ```
 
-### B) Typhoon OCR (remote API)
+### C) Typhoon OCR (remote API)
 
 This mirrors the structure / robustness of the reference pipeline:
 [`mjenmana/thai-election-2026`](https://github.com/mjenmana/thai-election-2026/tree/master)
@@ -80,6 +105,7 @@ python run_typhoon_ocr.py \
 ```
 
 Notes:
+
 - Outputs are `*.md` mirroring `--raw-root` under `--out-root`.
 - Manifest is append-only JSONL (source of truth for resuming).
 - `run_typhoon_ocr.py` will automatically load `env.local` by default (see `--env-file`).
@@ -98,6 +124,7 @@ python run_typhoon_ocr.py \
 ### C) Extract the numbers you care about (post-processing)
 
 This scans Typhoon OCR Markdown and extracts every occurrence of:
+
 - `จำนวน <n> คน`
 - `จำนวน <n> บัตร`
 
