@@ -53,7 +53,37 @@ class PDFLoader:
 
         widths = {int(p.shape[1]) for p in pages}
         if len(widths) != 1:
-            raise PDFCorruptedError(f"PDF pages have inconsistent widths: {sorted(widths)}")
+            if bool(getattr(config, "PDF_NORMALIZE_PAGE_WIDTHS", True)):
+                try:
+                    import cv2
+                except Exception as e:  # pragma: no cover
+                    raise PDFCorruptedError(
+                        f"PDF pages have inconsistent widths: {sorted(widths)} (and OpenCV unavailable to normalize)"
+                    ) from e
+
+                target_w = int(max(widths))
+                norm: List[np.ndarray] = []
+                for img in pages:
+                    h, w = img.shape[:2]
+                    if int(w) == int(target_w):
+                        norm.append(img)
+                        continue
+                    pad_right = int(target_w - int(w))
+                    # pad with white background (BGR 255)
+                    padded = cv2.copyMakeBorder(
+                        img,
+                        0,
+                        0,
+                        0,
+                        int(pad_right),
+                        borderType=cv2.BORDER_CONSTANT,
+                        value=(255, 255, 255),
+                    )
+                    norm.append(padded)
+                pages = norm
+                log.warning("Normalized PDF page widths by padding: %s -> %dpx", str(sorted(widths)), int(target_w))
+            else:
+                raise PDFCorruptedError(f"PDF pages have inconsistent widths: {sorted(widths)}")
 
         h0, w0 = pages[0].shape[:2]
         log.info("Loaded %d pages at %d DPI, dimensions: %d×%dpx", len(pages), self.dpi, w0, h0)

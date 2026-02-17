@@ -11,6 +11,10 @@ from __future__ import annotations
 # -------------------------
 PDF_DPI: int = 400
 
+# If a PDF has pages that render to slightly different widths (common with scans),
+# normalize by padding to a consistent width instead of failing.
+PDF_NORMALIZE_PAGE_WIDTHS: bool = True
+
 # -------------------------
 # Zone definitions (fractions of page height)
 # -------------------------
@@ -35,7 +39,10 @@ ZONE1_TEMPLATE_SEARCH_Y_FRAC: float = 0.65  # search top 65% of the page
 REGION_TEMPLATE_FILES_1: tuple[str, str] = ("region_begin.png", "region_end.png")
 REGION_TEMPLATE_FILES_2: tuple[str, str] = ("region_begin_2.png", "region_end_2.png")
 REGION_TEMPLATE_THRESHOLD: float = 0.70
-REGION_TEMPLATE_SCALES: tuple[float, ...] = (0.80, 0.90, 1.00, 1.10, 1.20)
+# Match debug_template_match.py defaults: 0.50..2.50 step 0.05
+REGION_TEMPLATE_SCALE_RANGE: tuple[float, float, float] = (0.50, 2.50, 0.05)  # (min, max, step)
+# Fallback discrete list (used only if REGION_TEMPLATE_SCALE_RANGE is missing/invalid)
+REGION_TEMPLATE_SCALES: tuple[float, ...] = (0.80, 0.90, 1.00, 1.10, 1.20, 1.40, 1.60, 1.75, 2.00)
 REGION_TEMPLATE_PAD_PX: int = 60
 REGION_TEMPLATE_SEARCH_Y_FRAC: float = 0.65  # search top 65% of the page
 REGION_TEMPLATE_SEARCH_X_FRAC: float = 1.0   # search full width by default
@@ -100,13 +107,20 @@ DEBUG_SAVE_INTERMEDIATES: bool = False
 # Place a grayscale PNG template under extract_handwritten_numbers/templates/
 LOGO_TEMPLATE_FILE: str = "logo.png"
 # Detect logo only in top band of the page (fraction of height)
+# Search only top band of the page for the crest logo (speed + fewer false positives).
 LOGO_SEARCH_Y_FRAC: float = 0.20
 # Template match threshold (TM_CCOEFF_NORMED)
 LOGO_DETECTION_THRESHOLD: float = 0.70
-# Multi-scale matching (±20% size variation)
-# NOTE: In practice, template DPI/cropping can differ from rendered page DPI.
-# Keep a wider scale sweep so we can still detect the crest logo reliably.
-LOGO_SCALES: tuple[float, ...] = (0.80, 0.90, 1.00, 1.10, 1.20, 1.30, 1.40, 1.50, 1.60, 1.75, 1.90, 2.00)
+# Downscale factor for logo template matching (speed); 0.25 = 4x smaller each axis (~16x faster).
+LOGO_MATCH_DOWNSCALE: float = 0.25
+# Restrict search to a center X-band (fractions of width).
+# The crest is typically centered; restricting reduces false positives and speeds up matching.
+LOGO_SEARCH_X_RANGE_FRAC: tuple[float, float] = (0.20, 0.80)
+# Scale sweep.
+# The debug script commonly uses 0.50..2.50 step 0.05; keep the same defaults here.
+LOGO_SCALE_RANGE: tuple[float, float, float] = (0.50, 2.50, 0.05)  # (min, max, step)
+# Fallback discrete list (used only if LOGO_SCALE_RANGE is missing/invalid)
+LOGO_SCALES: tuple[float, ...] = (0.80, 0.90, 1.00, 1.10, 1.20, 1.40, 1.60, 1.75, 2.00)
 
 # Only enable logo-based multi-document split for PDFs with at least this many pages.
 MIN_PAGES_FOR_LOGO_DETECTION: int = 3

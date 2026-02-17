@@ -18,6 +18,7 @@ __pycache__/
 
 # Large files (keep out of git)
 /data/
+/output/
 
 # Secrets
 .env

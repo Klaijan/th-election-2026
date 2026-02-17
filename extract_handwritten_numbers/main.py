@@ -168,6 +168,7 @@ def process_form(pdf_path: str, output_dir: str = "output", *, debug: bool = Fal
     debug_root = ensure_dir(out_root / "debug_output") if debug else None
 
     timings: Dict[str, float] = {}
+    step2_detail: Dict[str, Any] = {}
 
     def _write_failure_result(err: str) -> Dict[str, Any]:
         """
@@ -182,6 +183,7 @@ def process_form(pdf_path: str, output_dir: str = "output", *, debug: bool = Fal
                 "processing_time": None,
                 "timestamp": datetime.now(timezone.utc).isoformat(),
                 "timings": {k: round(float(v), 3) for k, v in timings.items()},
+                "step2_zone_detection_detail": step2_detail,
                 "extractions": {"fields": 0, "table_column_3": 0, "total": 0},
             },
         }
@@ -217,6 +219,7 @@ def process_form(pdf_path: str, output_dir: str = "output", *, debug: bool = Fal
                     m["document_id"] = 0
                     m["logo_detected"] = False
                     m["logo_confidence"] = 0.0
+            step2_detail = getattr(zone_detector, "last_step2_breakdown", {}) or {}
         timings["step2_zone_detection_s"] = float(t.dt or 0.0)
 
         if debug_root is not None:
@@ -241,7 +244,7 @@ def process_form(pdf_path: str, output_dir: str = "output", *, debug: bool = Fal
                     doc_local = int(doc_list.index(int(m.get("page_num", 0) or 0)) + 1)
                 except Exception:
                     doc_local = 1
-                logo_fn = f"page_{p}_doc_{did0+1}_page_{doc_local}_logo.jpg"
+                logo_fn = f"page_{p:02d}_doc_{did0+1:02d}_page_{doc_local:02d}_logo.jpg"
                 save_image(
                     debug_root / logo_fn,
                     _draw_logo_overlay(
@@ -264,10 +267,21 @@ def process_form(pdf_path: str, output_dir: str = "output", *, debug: bool = Fal
                             img, m.get("zone1_template_hits") or [], search_zone, search_x
                         ),
                     )
+                    # Also save with doc-style naming (helps multi-form PDFs). Note: zone1_template_hits will contain
+                    # region_begin/end hits on logo-detected pages (by design).
+                    save_image(
+                        debug_root / f"page_{p:02d}_doc_{did0+1:02d}_page_{doc_local:02d}_region_templates_detected.jpg",
+                        zone_detector.visualize_zone1_template_hits(
+                            img, m.get("zone1_template_hits") or [], search_zone, search_x
+                        ),
+                    )
                     save_image(
                         debug_root / f"page_{p:02d}_zone1_fields_zone.jpg",
                         _draw_zone1_fields_band(img, m["zones"]["fields"]),
                     )
+
+            # Dump full page metadata for debugging splits/logo confidence/template status.
+            save_json(debug_root / "page_meta.json", page_meta)
 
         # STEP 3: Extraction (multi-document)
         docs = _group_pages_by_document(page_meta)
@@ -425,6 +439,7 @@ def process_form(pdf_path: str, output_dir: str = "output", *, debug: bool = Fal
                 "processing_time": round(total_s, 3),
                 "timestamp": datetime.now(timezone.utc).isoformat(),
                 "timings": {k: round(float(v), 3) for k, v in timings.items()},
+                "step2_zone_detection_detail": step2_detail,
                 "extractions": {
                     "fields": len(field_regions),
                     "table_column_3": len(table_regions),

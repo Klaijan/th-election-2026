@@ -6,6 +6,22 @@ This repo contains two things:
 - OCR cropped outputs via **Typhoon OCR** (remote API)
 - Multi-page Thai form pipeline to extract handwritten numbers on/above dotted lines and **table column 3 only** (Google Cloud Vision)
 
+### Quick flow (end-to-end)
+
+- **Crop PDFs (optional)**: `crop_pdf_page.py` / `batch_crop_pdfs.py` → smaller PDFs with consistent regions.
+- **OCR path #1 (Typhoon)**: `run_typhoon_ocr.py` → Markdown per file + JSONL manifest (resume/skip) → `extract_typhoon_counts.py` pulls `จำนวน <n> คน/บัตร`.
+- **OCR path #2 (Thai multi-page forms)**: `main.py` → `extract_handwritten_numbers/`
+  - PDF → images (default 400 DPI)
+  - **Template/zone detection** (page 1 band via `template_4.png` + `template_5.png`; optional logo split + region anchors)
+  - Detect dotted lines (fields) + detect table grid (continuation pages) → crop **fields + last table column**
+  - **One batch OCR** (Google Vision; Tesseract fallback) → validate + write `output/**/result.json` (+ `debug_output/`)
+
+### Status / not done yet (WIP)
+
+- **Template detector tuning**: zone/template matching thresholds + robustness across scan variants is still in progress (`extract_handwritten_numbers/zone_detector.py`, templates under `extract_handwritten_numbers/templates/`).
+- **OCR review/tuning**: OCR is wired (`extract_handwritten_numbers/ocr_processor.py`) but accuracy, failure modes, and post-processing rules still need a real review on your target scans.
+- **Two OCR files**: Typhoon OCR entrypoint is `run_typhoon_ocr.py` (repo root), and the multi-page pipeline OCR module is `extract_handwritten_numbers/ocr_processor.py` (inside the package).
+
 ### Setup
 
 Recommended: use **pyenv** to pin a Python version for this project.

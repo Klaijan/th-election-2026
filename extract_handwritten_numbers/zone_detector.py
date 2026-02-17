@@ -24,6 +24,8 @@ class ZoneDetector:
 
     def __init__(self) -> None:
         self._logged_zone1_template_fallback = False
+        # Populated after classify_* calls; used by main.py to include step-2 breakdowns in result.json.
+        self.last_step2_breakdown: dict = {}
 
     @staticmethod
     def _zone_px(height: int, frac_zone: Tuple[float, float]) -> Tuple[int, int]:
@@ -40,28 +42,35 @@ class ZoneDetector:
         Backwards-compatible single-document classification.
         For multi-document PDFs, use `classify_pages_with_logo_detection()`.
         """
+        import time
+
+        t_total0 = time.perf_counter()
         out: List[Dict] = []
+        t_region_templates = 0.0
+        t_has_table = 0.0
+        n_region_pages = 0
+        n_has_table_pages = 0
         for i, page in enumerate(pages):
             h, w = page.shape[:2]
             if i == 0:
                 # Page 1:
                 # - No header zone (template/bullet approach makes header zoning unnecessary)
-                # - Fields zone inferred from zone-1 templates (template_4 = top, template_5 = bottom)
+                # - Fields zone inferred from region templates (region_begin/end) when available
                 header = (0, 0)
                 table = self._zone_px(h, config.TABLE_ZONE)
-                # Zone-1 templates search window is independent of table zone:
-                # left X% (config.ZONE1_TEMPLATE_SEARCH_X_FRAC) and top Y% (config.ZONE1_TEMPLATE_SEARCH_Y_FRAC)
-                y_end = int(round(float(h) * float(getattr(config, "ZONE1_TEMPLATE_SEARCH_Y_FRAC", 0.65))))
+                # Region templates search window:
+                y_end = int(round(float(h) * float(getattr(config, "REGION_TEMPLATE_SEARCH_Y_FRAC", 0.65))))
                 y_end = max(1, min(y_end, h))
-                x_end = int(round(float(w) * float(getattr(config, "ZONE1_TEMPLATE_SEARCH_X_FRAC", 0.5))))
+                x_end = int(round(float(w) * float(getattr(config, "REGION_TEMPLATE_SEARCH_X_FRAC", 1.0))))
                 x_end = max(1, min(x_end, w))
-                fields, zone1_hits = self._infer_fields_zone_from_zone1_templates(
+                t0 = time.perf_counter()
+                fields, zone1_hits, region_status = self._infer_fields_zone_from_region_templates(
                     page, search_zone=(0, int(y_end)), search_x_end=int(x_end)
                 )
-                if fields == (0, 0):
-                    # Fallback: broad top-Y% band (still avoids table area in most forms).
-                    fields = (0, int(y_end))
-                    zone1_hits = []
+                t_region_templates += float(time.perf_counter() - t0)
+                n_region_pages += 1
+                # IMPORTANT: if anchors are not found, do NOT fall back to a broad band.
+                # Caller should skip dotted-line detection when fields=(0,0).
             else:
                 # Continuation pages: treat as table-only (full page).
                 header = (0, 0)
@@ -70,9 +79,13 @@ class ZoneDetector:
                 zone1_hits = []
                 x_end = 0
                 y_end = 0
+                region_status = {"status": "n/a"}
 
+            t0 = time.perf_counter()
             has_table = self._has_table_grid(page, table)
-            has_fields = (i == 0)  # typical forms: only page 1 has bullet fields
+            t_has_table += float(time.perf_counter() - t0)
+            n_has_table_pages += 1
+            has_fields = bool(i == 0 and fields != (0, 0))
 
             out.append(
                 {
@@ -83,8 +96,20 @@ class ZoneDetector:
                     "page_size": (w, h),
                     "zone1_template_hits": zone1_hits,
                     "zone1_template_search": {"x_end": int(x_end), "y_end": int(y_end)},
+                    "region_templates": region_status,
                 }
             )
+        t_total = float(time.perf_counter() - t_total0)
+        self.last_step2_breakdown = {
+            "mode": "single_document",
+            "total_s": float(t_total),
+            "region_templates_s": float(t_region_templates),
+            "region_templates_pages": int(n_region_pages),
+            "region_templates_avg_s_per_page": float(t_region_templates / max(1, n_region_pages)),
+            "has_table_grid_s": float(t_has_table),
+            "has_table_grid_pages": int(n_has_table_pages),
+            "has_table_grid_avg_s_per_page": float(t_has_table / max(1, n_has_table_pages)),
+        }
         return out
 
     def classify_pages_with_logo_detection(self, pages: List[np.ndarray]) -> List[Dict]:
@@ -106,13 +131,30 @@ class ZoneDetector:
         last_first_page = -10_000
         out: List[Dict] = []
 
+        import time
+
+        t_total0 = time.perf_counter()
+        logo_time_total = 0.0
+        region_time_total = 0.0
+        has_table_time_total = 0.0
+        n_logo_pages = 0
+        n_region_pages = 0
+        n_has_table_pages = 0
+        skip_logo_detection = False
         for i, page in enumerate(pages):
             h, w = page.shape[:2]
 
             hit = {"has_logo": False, "confidence": 0.0, "position": (0, 0), "bbox": (0, 0, 0, 0), "scale": 1.0}
             if use_logo:
                 try:
-                    hit = logo.detect_logo(page)
+                    if not bool(skip_logo_detection):
+                        t0 = time.perf_counter()
+                        hit = logo.detect_logo(page)
+                        logo_time_total += float(time.perf_counter() - t0)
+                        n_logo_pages += 1
+                    else:
+                        # If previous page was marked first/logo, the immediate next page is treated as continuation.
+                        hit = {"has_logo": False, "confidence": 0.0, "position": (0, 0), "bbox": (0, 0, 0, 0), "scale": 1.0}
                 except Exception as e:
                     log.warning("Logo detection failed on page %d (%s). Continuing without logo for this page.", i + 1, str(e))
                     hit = {"has_logo": False, "confidence": 0.0, "position": (0, 0), "bbox": (0, 0, 0, 0), "scale": 1.0}
@@ -139,6 +181,9 @@ class ZoneDetector:
             elif i == 0 and is_first_page:
                 last_first_page = i
 
+            # If this page is marked as first page (forced or logo-detected), skip detection on the immediate next page.
+            skip_logo_detection = bool(is_first_page)
+
             if is_first_page:
                 header_y1 = int(round(float(h) * float(getattr(config, "LOGO_SEARCH_Y_FRAC", 0.20))))
                 header_y1 = max(1, min(header_y1, h))
@@ -153,19 +198,14 @@ class ZoneDetector:
                 )
                 x_end = max(1, min(x_end, w))
                 region_status: dict = {"status": "skipped"}
-                # Requirement: for pages where logo is detected, infer fields zone from region_begin/region_end templates.
-                # If rejected, fall back to region_begin_2/region_end_2. If none, keep status+filenames in metadata.
-                if bool(hit.get("has_logo", False)):
-                    fields, zone1_hits, region_status = self._infer_fields_zone_from_region_templates(
-                        page, search_zone=(0, int(y_end)), search_x_end=int(x_end)
-                    )
-                else:
-                    fields, zone1_hits = self._infer_fields_zone_from_zone1_templates(
-                        page, search_zone=(0, int(y_end)), search_x_end=int(x_end)
-                    )
-                if fields == (0, 0):
-                    fields = (0, int(y_end))
-                    zone1_hits = []
+                # Use region templates to define the fields band on FIRST pages.
+                # If anchors are not found, do NOT fall back to a broad band; dotted-line detection must be skipped.
+                t0 = time.perf_counter()
+                fields, zone1_hits, region_status = self._infer_fields_zone_from_region_templates(
+                    page, search_zone=(0, int(y_end)), search_x_end=int(x_end)
+                )
+                region_time_total += float(time.perf_counter() - t0)
+                n_region_pages += 1
             else:
                 header = (0, 0)
                 fields = (0, 0)
@@ -175,8 +215,11 @@ class ZoneDetector:
                 y_end = 0
                 region_status = {"status": "n/a"}
 
+            t0 = time.perf_counter()
             has_table = self._has_table_grid(page, table)
-            has_fields = bool(is_first_page)
+            has_table_time_total += float(time.perf_counter() - t0)
+            n_has_table_pages += 1
+            has_fields = bool(is_first_page and fields != (0, 0))
 
             out.append(
                 {
@@ -207,6 +250,30 @@ class ZoneDetector:
                     len(first_pages),
                     len(pages),
                 )
+
+        if use_logo:
+            # helpful for performance debugging
+            log.info(
+                "Logo detection time total: %.3fs for %d pages (avg %.3fs/page)",
+                logo_time_total,
+                int(n_logo_pages),
+                logo_time_total / max(1, n_logo_pages),
+            )
+
+        t_total = float(time.perf_counter() - t_total0)
+        self.last_step2_breakdown = {
+            "mode": "multi_document_logo",
+            "total_s": float(t_total),
+            "logo_detection_s": float(logo_time_total),
+            "logo_detection_pages": int(n_logo_pages),
+            "logo_detection_avg_s_per_page": float(logo_time_total / max(1, n_logo_pages)),
+            "region_templates_s": float(region_time_total),
+            "region_templates_pages": int(n_region_pages),
+            "region_templates_avg_s_per_page": float(region_time_total / max(1, n_region_pages)),
+            "has_table_grid_s": float(has_table_time_total),
+            "has_table_grid_pages": int(n_has_table_pages),
+            "has_table_grid_avg_s_per_page": float(has_table_time_total / max(1, n_has_table_pages)),
+        }
 
         return out
 
@@ -318,7 +385,23 @@ class ZoneDetector:
         templates_dir = (Path(__file__).resolve().parent / "templates")
 
         thr = float(getattr(config, "REGION_TEMPLATE_THRESHOLD", 0.70))
-        scales = list(getattr(config, "REGION_TEMPLATE_SCALES", (0.80, 0.90, 1.00, 1.10, 1.20)))
+        # Prefer range sweep to match debug script behavior.
+        scales: list[float] = []
+        rng = getattr(config, "REGION_TEMPLATE_SCALE_RANGE", None)
+        if isinstance(rng, (tuple, list)) and len(rng) == 3:
+            try:
+                a, b, step = float(rng[0]), float(rng[1]), float(rng[2])
+                if step > 0 and a > 0 and b >= a:
+                    x = a
+                    for _ in range(2000):
+                        if x > b + 1e-9:
+                            break
+                        scales.append(float(x))
+                        x += step
+            except Exception:
+                scales = []
+        if not scales:
+            scales = list(getattr(config, "REGION_TEMPLATE_SCALES", (0.80, 0.90, 1.00, 1.10, 1.20)))
         pad = int(getattr(config, "REGION_TEMPLATE_PAD_PX", 60))
 
         files1 = tuple(getattr(config, "REGION_TEMPLATE_FILES_1", ("region_begin.png", "region_end.png")))
