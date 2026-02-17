@@ -1,4 +1,4 @@
-## Vote69 — Crop PDFs + Typhoon OCR
+## Vote69 — Mirror ECT drives and OCR Pipeline
 
 This repo currently does four things:
 
