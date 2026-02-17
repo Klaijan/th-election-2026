@@ -29,8 +29,8 @@ if [[ -z "$py_local" ]]; then
   exit 3
 fi
 
-if pyenv versions --bare | tr -d '[:space:]' | grep -Fxq "$py_local"; then
-  : "pyenv local '$py_local' already exists"
+if pyenv versions --bare | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | grep -Fxq "$py_local"; then 
+: "pyenv local '$py_local' already exists"
 else
   base_py="${PYTHON_VERSION:-}"
   if [[ -z "$base_py" ]]; then
