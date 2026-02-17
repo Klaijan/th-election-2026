@@ -72,13 +72,13 @@ The script will write files under `data/`, and can be re-run as it will only cop
 Default crop (full width, 30%..60% of page height) into a new 1-page PDF:
 
 ```bash
-python crop_pdf_page.py --pdf data/sample/district/1.pdf --out data/sample/cropped/district/1.pdf
+python scripts/crop_pdf_page.py --pdf data/sample/district/1.pdf --out data/sample/cropped/district/1.pdf
 ```
 
 Batch crop and keep filenames under `cropped/{district,partylist}/`:
 
 ```bash
-python batch_crop_pdfs.py --input-dir data/sample --out-root data/sample --crop-script crop_pdf_page.py
+python scripts/batch_crop_pdfs.py --input-dir data/sample --out-root data/sample --crop-script crop_pdf_page.py
 ```
 
 ### C) Typhoon OCR (remote API)
@@ -96,7 +96,7 @@ cp env.example env.local
 Run OCR (writes Markdown outputs + JSONL manifest, and supports resume/skips):
 
 ```bash
-python run_typhoon_ocr.py \
+python scripts/run_typhoon_ocr.py \
   --raw-root data/sample/cropped \
   --out-root data/sample/typhoon_md \
   --manifest-jsonl data/sample/typhoon_manifest.jsonl \
@@ -114,7 +114,7 @@ Notes:
 - Preflight without API calls:
 
 ```bash
-python run_typhoon_ocr.py \
+python scripts/run_typhoon_ocr.py \
   --raw-root data/sample/cropped \
   --out-root data/sample/typhoon_md \
   --manifest-jsonl data/sample/typhoon_manifest.jsonl \
@@ -133,7 +133,7 @@ It keeps the **order** (so you can rely on position) and also captures an option
 Example (partylist):
 
 ```bash
-python extract_typhoon_counts.py \
+python scripts/extract_typhoon_counts.py \
   --md-root data/sample/typhoon_md \
   --out-jsonl data/sample/typhoon_counts_partylist.jsonl \
   --kind partylist
