@@ -8,10 +8,7 @@ This file delegates to `extract_handwritten_numbers.main` so you can run:
   python main.py --input path/to/folder --out output --debug
 """
 
-from extract_handwritten_numbers.main import _cli
-
+from scripts.extract_handwritten_numbers.main import _cli
 
 if __name__ == "__main__":
     raise SystemExit(_cli())
-
-
