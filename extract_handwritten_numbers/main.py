@@ -288,6 +288,7 @@ def process_form(pdf_path: str, output_dir: str = "output", *, debug: bool = Fal
         doc_results_meta: List[Dict[str, Any]] = []
         field_regions: List[ExtractedRegion] = []
         table_regions: List[ExtractedRegion] = []
+        dot_debug_summary: List[Dict[str, Any]] = []
 
         with Timer("extract_all_documents") as t_extract:
             for did, doc_pages in sorted(docs.items(), key=lambda kv: int(kv[0])):
@@ -316,9 +317,52 @@ def process_form(pdf_path: str, output_dir: str = "output", *, debug: bool = Fal
                             debug_root / f"page_{int(first_idx)+1:02d}_dots_detected.jpg",
                             dot_det.visualize_detection(pages[first_idx], dotted, field_zone),
                         )
+                        dot_debug_summary.append(
+                            {
+                                "kind": "fields_first_page",
+                                "document_id": int(did),
+                                "page_num": int(first_idx),
+                                "zone": [int(field_zone[0]), int(field_zone[1])],
+                                "dotted_lines": int(len(dotted)),
+                            }
+                        )
                         for r in doc_field_regions:
                             save_image(debug_root / f"{r.region_id}_raw.jpg", r.raw_image)
                             save_image(debug_root / f"{r.region_id}_preprocessed.jpg", r.image)
+
+                # Debug-only: run dot detection on every logo-detected page (using inferred fields band)
+                # and on every table page (restricted to the last-column ROI).
+                if debug_root is not None:
+                    dot_det = DotDetector()
+                    for doc_local_idx, m in enumerate(doc_pages, start=1):
+                        page_num = int(m.get("page_num", 0))
+                        img = pages[page_num]
+
+                        # (A) Pages with logo: run dot detection within the inferred fields band.
+                        if bool(m.get("logo_detected", False)):
+                            fz = (m.get("zones") or {}).get("fields") or (0, 0)
+                            try:
+                                y0, y1 = int(fz[0]), int(fz[1])
+                            except Exception:
+                                y0, y1 = 0, 0
+                            if y1 > y0:
+                                dotted = dot_det.detect_dotted_lines(img, (int(y0), int(y1)))
+                                save_image(
+                                    debug_root
+                                    / f"page_{page_num+1:02d}_doc_{int(did)+1:02d}_page_{int(doc_local_idx):02d}_fields_dots_detected.jpg",
+                                    dot_det.visualize_detection(img, dotted, (int(y0), int(y1))),
+                                )
+                                dot_debug_summary.append(
+                                    {
+                                        "kind": "fields_logo_page",
+                                        "document_id": int(did),
+                                        "page_num": int(page_num),
+                                        "doc_page_index": int(doc_local_idx),
+                                        "zone": [int(y0), int(y1)],
+                                        "dotted_lines": int(len(dotted)),
+                                        "region_templates_status": (m.get("region_templates") or {}).get("status"),
+                                    }
+                                )
 
                 # Tables (all pages in doc)
                 td = TableDetector()
@@ -363,6 +407,47 @@ def process_form(pdf_path: str, output_dir: str = "output", *, debug: bool = Fal
                         for r in page_cells[:12]:
                             save_image(debug_root / f"{r.region_id}_raw.jpg", r.raw_image)
                             save_image(debug_root / f"{r.region_id}_preprocessed.jpg", r.image)
+
+                    # Debug-only: dot detection within last-column ROI (for table pages).
+                    if debug_root is not None:
+                        try:
+                            x0, x1 = (int(struct.target_column[0]), int(struct.target_column[1]))
+                            y0, y1 = (int(struct.bbox.y), int(struct.bbox.y2))
+                            h, w = img.shape[:2]
+                            x0 = max(0, min(x0, w))
+                            x1 = max(0, min(x1, w))
+                            y0 = max(0, min(y0, h))
+                            y1 = max(0, min(y1, h))
+                            if x1 > x0 and y1 > y0:
+                                roi = img[y0:y1, x0:x1].copy()
+                                dotted = dot_det.detect_dotted_lines(roi, (0, int(roi.shape[0])))
+                                roi_overlay = dot_det.visualize_detection(roi, dotted, (0, int(roi.shape[0])))
+                                overlay = img.copy()
+                                overlay[y0:y1, x0:x1] = roi_overlay
+                                cv2.rectangle(overlay, (x0, y0), (x1, y1), (255, 0, 255), 4)
+                                # doc-local index for this page within the document (1-based)
+                                doc_local_idx = 1
+                                try:
+                                    doc_local_idx = int([int(mm.get("page_num", 0)) for mm in doc_pages].index(int(page_num)) + 1)
+                                except Exception:
+                                    doc_local_idx = 1
+                                save_image(
+                                    debug_root
+                                    / f"page_{page_num+1:02d}_doc_{int(did)+1:02d}_page_{int(doc_local_idx):02d}_table_lastcol_dots_detected.jpg",
+                                    overlay,
+                                )
+                                dot_debug_summary.append(
+                                    {
+                                        "kind": "table_lastcol",
+                                        "document_id": int(did),
+                                        "page_num": int(page_num),
+                                        "doc_page_index": int(doc_local_idx),
+                                        "roi": [int(x0), int(y0), int(x1 - x0), int(y1 - y0)],
+                                        "dotted_lines": int(len(dotted)),
+                                    }
+                                )
+                        except Exception:
+                            pass
 
                 table_regions.extend(doc_table_regions)
 
@@ -460,6 +545,7 @@ def process_form(pdf_path: str, output_dir: str = "output", *, debug: bool = Fal
         if debug_root is not None:
             save_json(debug_root / "timing_breakdown.json", timings)
             save_json(debug_root / "ocr_results.json", {k: v.__dict__ for k, v in ocr_results.items()})
+            save_json(debug_root / "dot_detection_summary.json", dot_debug_summary)
 
         log.info("Step 1: Loaded %d pages (%.3fs)", len(pages), timings.get("step1_load_pdf_s", 0.0))
         log.info(
