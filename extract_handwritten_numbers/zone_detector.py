@@ -85,6 +85,9 @@ class ZoneDetector:
                         region_status = {
                             **(region_status or {}),
                             "status": "fallback_zone1_templates",
+                            "method": "zone1_templates",
+                            "used_templates": [str(h.get("template_file", "")) for h in (hits2 or []) if str(h.get("template_file", ""))],
+                            "threshold": float(getattr(config, "ZONE1_TEMPLATE_THRESHOLD", 0.60)),
                         }
                         # Update search window metadata to match the fallback method.
                         y_end = int(y_end2)
@@ -99,7 +102,13 @@ class ZoneDetector:
                     if yy1 > yy0:
                         fields = (int(yy0), int(yy1))
                         zone1_hits = []
-                        region_status = {**(region_status or {}), "status": "fallback_fixed_band"}
+                        region_status = {
+                            **(region_status or {}),
+                            "status": "fallback_fixed_band",
+                            "method": "fixed_band",
+                            "used_templates": [],
+                            "band_y_frac": list(getattr(config, "FIELDS_FALLBACK_Y_FRAC", (0.35, 0.78))),
+                        }
             else:
                 # Continuation pages: treat as table-only (full page).
                 header = (0, 0)
@@ -249,7 +258,13 @@ class ZoneDetector:
                     if fields2 != (0, 0):
                         fields = fields2
                         zone1_hits = hits2
-                        region_status = {**(region_status or {}), "status": "fallback_zone1_templates"}
+                        region_status = {
+                            **(region_status or {}),
+                            "status": "fallback_zone1_templates",
+                            "method": "zone1_templates",
+                            "used_templates": [str(h.get("template_file", "")) for h in (hits2 or []) if str(h.get("template_file", ""))],
+                            "threshold": float(getattr(config, "ZONE1_TEMPLATE_THRESHOLD", 0.60)),
+                        }
                         y_end = int(y_end2)
                         x_end = int(x_end2)
                 # Final fallback: fixed band (conservative) for first pages only.
@@ -262,7 +277,13 @@ class ZoneDetector:
                     if yy1 > yy0:
                         fields = (int(yy0), int(yy1))
                         zone1_hits = []
-                        region_status = {**(region_status or {}), "status": "fallback_fixed_band"}
+                        region_status = {
+                            **(region_status or {}),
+                            "status": "fallback_fixed_band",
+                            "method": "fixed_band",
+                            "used_templates": [],
+                            "band_y_frac": list(getattr(config, "FIELDS_FALLBACK_Y_FRAC", (0.35, 0.78))),
+                        }
             else:
                 header = (0, 0)
                 fields = (0, 0)
@@ -527,10 +548,38 @@ class ZoneDetector:
                 used = "set2"
 
         if got is None:
-            return (0, 0), [], {"status": "none", "used": None, "threshold": float(thr), "scales": list(scales), "tried": tried}
+            return (
+                (0, 0),
+                [],
+                {
+                    "status": "none",
+                    "method": "region_templates",
+                    "used": None,
+                    "used_templates": [],
+                    "threshold": float(thr),
+                    "scales": list(scales),
+                    "tried": tried,
+                },
+            )
 
         band, hits = got
-        return band, hits, {"status": "ok", "used": used, "threshold": float(thr), "scales": list(scales), "tried": tried}
+        if used == "set2":
+            used_files = [str(files2[0]), str(files2[1])]
+        else:
+            used_files = [str(files1[0]), str(files1[1])]
+        return (
+            band,
+            hits,
+            {
+                "status": "ok",
+                "method": "region_templates",
+                "used": used,
+                "used_templates": list(used_files),
+                "threshold": float(thr),
+                "scales": list(scales),
+                "tried": tried,
+            },
+        )
 
     @staticmethod
     def _best_template_hit(
