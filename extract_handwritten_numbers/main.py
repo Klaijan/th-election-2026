@@ -127,6 +127,12 @@ def _draw_region_template_diagnostics_overlay(page_bgr: np.ndarray, meta: Dict[s
     y_end = max(1, min(y_end, h))
     cv2.rectangle(out, (0, 0), (x_end - 1, y_end - 1), (255, 0, 0), 2)
 
+    # Draw zones on top (lets you verify which band we will actually use/skip)
+    try:
+        out = _draw_zones(out, meta.get("zones") or {})
+    except Exception:
+        pass
+
     rt = meta.get("region_templates") or {}
     thr = rt.get("threshold", None)
     method = str(rt.get("method", ""))
@@ -356,8 +362,11 @@ def process_form(pdf_path: str, output_dir: str = "output", *, debug: bool = Fal
                     # region_begin/end hits on logo-detected pages (by design).
                     save_image(
                         debug_root / f"page_{p:02d}_doc_{did0+1:02d}_page_{doc_local:02d}_region_templates_detected.jpg",
-                        zone_detector.visualize_zone1_template_hits(
-                            img, m.get("zone1_template_hits") or [], search_zone, search_x
+                        _draw_zones(
+                            zone_detector.visualize_zone1_template_hits(
+                                img, m.get("zone1_template_hits") or [], search_zone, search_x
+                            ),
+                            m.get("zones") or {},
                         ),
                     )
                     # Best-hit diagnostics overlay (shows best matches even if rejected)
@@ -379,6 +388,10 @@ def process_form(pdf_path: str, output_dir: str = "output", *, debug: bool = Fal
         field_regions: List[ExtractedRegion] = []
         table_regions: List[ExtractedRegion] = []
         dot_debug_summary: List[Dict[str, Any]] = []
+        processed_pages: set[int] = set()
+        table_page_times: List[float] = []
+        table_pages_attempted: int = 0
+        table_pages_failed: int = 0
 
         with Timer("extract_all_documents") as t_extract:
             for did, doc_pages in sorted(docs.items(), key=lambda kv: int(kv[0])):
@@ -416,6 +429,7 @@ def process_form(pdf_path: str, output_dir: str = "output", *, debug: bool = Fal
                     fe = FieldExtractor(remove_dots=True)
                     doc_field_regions = fe.extract_fields(pages[first_idx], field_zone, debug=debug, region_id_prefix=prefix)
                     field_regions.extend(doc_field_regions)
+                    processed_pages.add(int(first_idx))
 
                     if debug_root is not None:
                         dot_det = DotDetector()
@@ -483,10 +497,36 @@ def process_form(pdf_path: str, output_dir: str = "output", *, debug: bool = Fal
                     page_num = int(m.get("page_num", 0))
                     if not bool(m.get("has_table", False)):
                         continue
+                    processed_pages.add(int(page_num))
                     img = pages[page_num]
                     zone = m["zones"]["table"]
-                    bbox = td.detect_table_boundary(img, zone)
-                    struct = td.parse_table_structure(img, bbox)
+                    import time
+
+                    t0_page = time.perf_counter()
+                    table_pages_attempted += 1
+                    try:
+                        bbox = td.detect_table_boundary(img, zone)
+                        struct = td.parse_table_structure(img, bbox)
+                    except Exception as e:
+                        table_pages_failed += 1
+                        manual_review.append(
+                            {
+                                "document_id": int(did),
+                                "page": int(page_num),
+                                "reason": "table_detection_failed",
+                                "error": str(e),
+                            }
+                        )
+                        log.warning(
+                            "Manual review needed: pdf=%s doc=%d page=%d table detection failed (%s). Skipping table extraction for this page.",
+                            str(pdf_path),
+                            int(did),
+                            int(page_num) + 1,
+                            str(e),
+                        )
+                        continue
+                    finally:
+                        table_page_times.append(float(time.perf_counter() - t0_page))
 
                     if bool(m.get("is_first_page", False)):
                         target_col = struct.target_column
@@ -627,12 +667,33 @@ def process_form(pdf_path: str, output_dir: str = "output", *, debug: bool = Fal
         timings["step5_validation_s"] = float(t.dt or 0.0)
 
         total_s = float(sum(timings.values()))
+        # Summary stats
+        total_pages = int(len(pages))
+        total_docs = int(len(doc_results_meta) or 1)
+        avg_s_per_page = float(total_s / max(1, total_pages))
+        timings["avg_total_s_per_page"] = float(avg_s_per_page)
+        timings["avg_step2_zone_detection_s_per_page"] = float(timings.get("step2_zone_detection_s", 0.0) / max(1, total_pages))
+        timings["avg_step3_extraction_s_per_page"] = float(timings.get("step3_extract_all_documents_s", 0.0) / max(1, total_pages))
+        if table_page_times:
+            timings["avg_table_detection_s_per_table_page"] = float(sum(table_page_times) / max(1, len(table_page_times)))
+        log.info("Docs found: %d", total_docs)
+        log.info("Pages: %d  processed_pages: %d", total_pages, int(len(processed_pages)))
+        log.info("Avg total time: %.3fs/page", avg_s_per_page)
+        if table_page_times:
+            log.info(
+                "Table detection: attempted=%d failed=%d avg=%.3fs/table-page",
+                int(table_pages_attempted),
+                int(table_pages_failed),
+                float(sum(table_page_times) / max(1, len(table_page_times))),
+            )
         result: Dict[str, Any] = {
             "metadata": {
                 "pdf_path": str(pdf_path),
                 "pages": int(len(pages)),
+                "pages_processed": int(len(processed_pages)),
                 "total_documents": int(len(doc_results_meta) or 1),
                 "processing_time": round(total_s, 3),
+                "avg_total_s_per_page": float(avg_s_per_page),
                 "timestamp": datetime.now(timezone.utc).isoformat(),
                 "timings": {k: round(float(v), 3) for k, v in timings.items()},
                 "step2_zone_detection_detail": step2_detail,
