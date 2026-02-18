@@ -77,7 +77,7 @@ class OCRItem:
     text: str
     raw_text: str
     confidence: float
-    provider: Literal["google", "tesseract", "unknown"] = "unknown"
+    provider: Literal["google", "gemini", "tesseract", "unknown"] = "unknown"
 
 
 @dataclass(frozen=True)

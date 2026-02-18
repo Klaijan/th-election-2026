@@ -9,6 +9,7 @@ import cv2
 import numpy as np
 
 from . import config
+from .gemini_client import ocr_image_bytes_with_gemini, resolve_gemini_api_key, validate_gemini_model
 from .types import OCRItem
 
 log = logging.getLogger("extract_handwritten_numbers")
@@ -38,15 +39,24 @@ class OCRProcessor:
     """
     Batch OCR handler.
 
-    Primary: Google Cloud Vision (batch_annotate_images).
+    Primary: Google Cloud Vision (batch_annotate_images) or Gemini API.
     Fallback: Tesseract via pytesseract (if installed); lower accuracy.
     """
 
-    def __init__(self, *, provider: str = config.OCR_PROVIDER, languages: Optional[List[str]] = None):
+    def __init__(
+        self,
+        *,
+        provider: str = config.OCR_PROVIDER,
+        languages: Optional[List[str]] = None,
+        model: Optional[str] = None,
+        api_key: Optional[str] = None,
+    ):
         self.provider = str(provider or "google").lower().strip()
         self.languages = list(languages or config.OCR_LANGUAGES)
+        self.model = str(model or config.OCR_MODEL).strip()
+        self.api_key = str(api_key or "").strip()
 
-    def batch_ocr(self, images: List[np.ndarray], image_ids: List[str], *, retries: int = 3) -> Dict[str, OCRItem]:
+    def batch_ocr(self, images: List[np.ndarray], image_ids: List[str], *, retries: int = config.OCR_RETRIES) -> Dict[str, OCRItem]:
         if len(images) != len(image_ids):
             raise ValueError("images and image_ids length mismatch")
         if not images:
@@ -59,10 +69,65 @@ class OCRProcessor:
                 log.warning("Google OCR failed (%s). Trying Tesseract fallback.", str(e))
                 return self._batch_tesseract(images, image_ids)
 
+        if self.provider == "gemini":
+            try:
+                return self._batch_gemini(images, image_ids, retries=int(retries))
+            except Exception as e:
+                log.warning("Gemini OCR failed (%s). Trying Tesseract fallback.", str(e))
+                return self._batch_tesseract(images, image_ids)
+
         if self.provider == "tesseract":
             return self._batch_tesseract(images, image_ids)
 
         raise ValueError(f"Unknown OCR provider: {self.provider}")
+
+    def _batch_gemini(self, images: List[np.ndarray], image_ids: List[str], *, retries: int) -> Dict[str, OCRItem]:
+        model = validate_gemini_model(self.model)
+        api_key = resolve_gemini_api_key(self.api_key or None)
+        lang_hint = ", ".join([x for x in self.languages if str(x).strip()])
+        prompt = "Extract all visible text from this image exactly. Return only text."
+        if lang_hint:
+            prompt += f" Preferred languages: {lang_hint}."
+
+        out: Dict[str, OCRItem] = {}
+        for img, img_id in zip(images, image_ids):
+            ok, buf = cv2.imencode(".png", img)
+            if not ok:
+                raise RuntimeError("cv2.imencode(.png) failed")
+
+            last_err: Optional[Exception] = None
+            raw = ""
+            for attempt in range(int(retries) + 1):
+                try:
+                    raw = ocr_image_bytes_with_gemini(
+                        image_bytes=buf.tobytes(),
+                        mime_type="image/png",
+                        model=model,
+                        api_key=api_key,
+                        prompt=prompt,
+                        timeout_s=float(config.OCR_TIMEOUT_S),
+                    )
+                    last_err = None
+                    break
+                except Exception as e:
+                    last_err = e
+                    if attempt >= int(retries):
+                        break
+                    sleep_s = (2**attempt) + random.random()
+                    time.sleep(sleep_s)
+
+            if last_err is not None:
+                raise RuntimeError(f"Gemini OCR failed for image {img_id}: {last_err}")
+
+            conf = 0.5 if str(raw).strip() else 0.0
+            out[img_id] = OCRItem(
+                image_id=img_id,
+                text=_digits_only(raw),
+                raw_text=str(raw),
+                confidence=float(conf),
+                provider="gemini",
+            )
+        return out
 
     def _batch_google(self, images: List[np.ndarray], image_ids: List[str], *, retries: int) -> Dict[str, OCRItem]:
         try:

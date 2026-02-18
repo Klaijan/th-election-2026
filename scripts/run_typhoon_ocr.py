@@ -53,6 +53,53 @@ def _get_ocr_document():
         ) from e
 
 
+def _get_gemini_helpers():
+    """
+    Import Gemini helper functions lazily to preserve script startup behavior.
+    """
+    try:
+        from extract_handwritten_numbers.gemini_client import (  # type: ignore
+            GEMINI_SUPPORTED_MODELS,
+            ocr_image_path_with_gemini,
+            resolve_gemini_api_key,
+            validate_gemini_model,
+        )
+        return GEMINI_SUPPORTED_MODELS, validate_gemini_model, resolve_gemini_api_key, ocr_image_path_with_gemini
+    except ModuleNotFoundError:
+        try:
+            from scripts.extract_handwritten_numbers.gemini_client import (  # type: ignore
+                GEMINI_SUPPORTED_MODELS,
+                ocr_image_path_with_gemini,
+                resolve_gemini_api_key,
+                validate_gemini_model,
+            )
+            return GEMINI_SUPPORTED_MODELS, validate_gemini_model, resolve_gemini_api_key, ocr_image_path_with_gemini
+        except ModuleNotFoundError as e:  # pragma: no cover
+            raise SystemExit(
+                "Missing local Gemini helper module: extract_handwritten_numbers.gemini_client"
+            ) from e
+
+
+def _resolve_provider(provider: str, model: str) -> str:
+    p = str(provider or "auto").strip().lower()
+    if p not in {"auto", "typhoon", "gemini"}:
+        raise SystemExit("Invalid --provider. Expected one of: auto, typhoon, gemini")
+    if p == "gemini":
+        _, validate_gemini_model, _, _ = _get_gemini_helpers()
+        try:
+            _ = validate_gemini_model(model)
+        except Exception as e:
+            raise SystemExit(str(e)) from e
+        return "gemini"
+    if p == "typhoon":
+        return "typhoon"
+
+    supported_models, _, _, _ = _get_gemini_helpers()
+    if str(model or "").strip().lower() in set(supported_models):
+        return "gemini"
+    return "typhoon"
+
+
 def fingerprint(path: Path) -> str:
     """
     Stable-ish fingerprint to support skipping previously processed files.
@@ -114,6 +161,47 @@ def _render_pdf_page_to_tmp_png(pdf_path: Path, *, page_num_1based: int, dpi: in
     return Path(tmp_path)
 
 
+def _ocr_with_gemini(path: Path, *, model: str, api_key: str) -> str:
+    _, validate_gemini_model, resolve_gemini_api_key, ocr_image_path_with_gemini = _get_gemini_helpers()
+    model_name = validate_gemini_model(model)
+    key = resolve_gemini_api_key(api_key)
+    prompt = "Extract all text from this image and return only OCR text in Markdown reading order."
+    return str(
+        ocr_image_path_with_gemini(
+            path,
+            model=model_name,
+            api_key=key,
+            prompt=prompt,
+            timeout_s=90.0,
+        )
+    )
+
+
+def _atomic_write_text(path: Path, text: str, *, encoding: str = "utf-8") -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_name = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding=encoding,
+            dir=str(path.parent),
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+            tmp_name = f.name
+        os.replace(str(tmp_name), str(path))
+    finally:
+        if tmp_name and os.path.exists(tmp_name):
+            try:
+                os.unlink(tmp_name)
+            except Exception:
+                pass
+
+
 def read_existing_fingerprint(out_md: Path) -> Optional[str]:
     """
     Reads fingerprint embedded in the first lines of the output markdown.
@@ -148,8 +236,10 @@ def ocr_one(
     rel: str,
     fp: str,
     out_md: Path,
+    provider: str,
     base_url: str,
-    api_key: str,
+    typhoon_api_key: str,
+    gemini_api_key: str,
     model: str,
     retries: int,
     retry_base_sleep: float,
@@ -158,12 +248,16 @@ def ocr_one(
 ) -> dict[str, Any]:
     t0 = time.time()
     try:
+        if provider != "gemini" and ocr_document_func is None:
+            raise RuntimeError("Typhoon OCR backend is selected but typhoon_ocr client is not available")
+
         n_pages = num_pages(path)
         md_parts: list[str] = []
 
         # Header for robust skipping even without manifest.
         md_parts.append(f"<!-- rel_path={rel} -->")
         md_parts.append(f"<!-- fingerprint={fp} -->")
+        md_parts.append(f"<!-- provider={provider} -->")
         md_parts.append(f"<!-- model={model} -->")
         md_parts.append("")
 
@@ -178,13 +272,16 @@ def ocr_one(
                 page_num = 1  # images always use page_num=1
             for attempt in range(retries + 1):
                 try:
-                    md = ocr_document_func(
-                        pdf_or_image_path=ocr_path,
-                        page_num=page_num,
-                        base_url=base_url,
-                        api_key=api_key,
-                        model=model,
-                    )
+                    if provider == "gemini":
+                        md = _ocr_with_gemini(Path(ocr_path), model=model, api_key=gemini_api_key)
+                    else:
+                        md = ocr_document_func(
+                            pdf_or_image_path=ocr_path,
+                            page_num=page_num,
+                            base_url=base_url,
+                            api_key=typhoon_api_key,
+                            model=model,
+                        )
                     md_parts.append(f"\n\n<!-- PAGE {page}/{n_pages} -->\n\n{md}")
                     last_err = None
                     break
@@ -207,13 +304,14 @@ def ocr_one(
                 except Exception:
                     pass
 
-        out_md.parent.mkdir(parents=True, exist_ok=True)
-        out_md.write_text("\n".join(md_parts), encoding="utf-8")
+        _atomic_write_text(out_md, "\n".join(md_parts), encoding="utf-8")
 
         return {
             "rel_path": rel,
             "fingerprint": fp,
             "status": "ok",
+            "provider": provider,
+            "model": model,
             "in_path": str(path),
             "out_md": str(out_md),
             "n_pages": n_pages,
@@ -224,6 +322,8 @@ def ocr_one(
             "rel_path": rel,
             "fingerprint": fp,
             "status": "error",
+            "provider": provider,
+            "model": model,
             "in_path": str(path),
             "out_md": str(out_md),
             "error": str(e),
@@ -290,7 +390,7 @@ def load_env_file(path: Path, *, override: bool = False) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(
-        description="Run Typhoon OCR over PDFs/images and write Markdown + manifests (resume-friendly).",
+        description="Run OCR (Typhoon or Gemini) over PDFs/images and write Markdown + manifests (resume-friendly).",
         allow_abbrev=False,
     )
     # New flag name (preferred) + legacy alias (matches older scripts / muscle memory)
@@ -315,7 +415,22 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--workers", type=int, default=3, help="Thread workers (API calls). Default: 3.")
     ap.add_argument("--max-seconds", type=int, default=7200, help="Stop after this many seconds (chunking). Default: 7200.")
     ap.add_argument("--max-files", type=int, default=0, help="0 = no limit. Otherwise process only first N pending.")
-    ap.add_argument("--model", default=os.environ.get("TYPHOON_MODEL", "typhoon-ocr"), help="Model name.")
+    ap.add_argument(
+        "--provider",
+        default=os.environ.get("OCR_PROVIDER", "auto"),
+        choices=["auto", "typhoon", "gemini"],
+        help="OCR provider. auto selects gemini when --model is a Gemini model, otherwise typhoon.",
+    )
+    ap.add_argument(
+        "--model",
+        default=os.environ.get("TYPHOON_MODEL", "typhoon-ocr"),
+        help="Model name. Gemini supports: gemini-3-pro, gemini-3-flash.",
+    )
+    ap.add_argument(
+        "--gemini-api-key",
+        default="",
+        help="Optional direct Gemini API key override. Otherwise uses GEMINI_API_KEY or GOOGLE_API_KEY.",
+    )
     ap.add_argument("--dpi", type=int, default=220, help="Render DPI for PDFs (PDF->PNG). Default: 220.")
     ap.add_argument("--retries", type=int, default=3, help="Retries per page. Default: 3.")
     ap.add_argument("--retry-sleep", type=float, default=2.0, help="Base backoff sleep seconds. Default: 2.0.")
@@ -345,20 +460,36 @@ def main(argv: list[str] | None = None) -> int:
     # Load env.local (or the provided file) by default so users don't need to `source` it.
     load_env_file(Path(str(args.env_file)), override=bool(args.env_override))
 
-    # Defaults / compatibility:
+    provider = _resolve_provider(str(args.provider), str(args.model))
+
+    # Typhoon defaults / compatibility:
     # - docs often use TYPHOON_OCR_API_KEY; keep supporting repo's TYPHOON_API_KEY too
     # - default base URL if not provided
     base_url = (os.environ.get("TYPHOON_BASE_URL") or "https://api.opentyphoon.ai/v1").strip()
-    api_key = (os.environ.get("TYPHOON_API_KEY") or os.environ.get("TYPHOON_OCR_API_KEY") or "").strip()
-    if not api_key or api_key in {"YOUR_KEY_HERE", "CHANGE_ME"}:
-        if args.dry_run:
-            print(
-                "Warning: missing/placeholder Typhoon API key "
-                "(set TYPHOON_API_KEY or TYPHOON_OCR_API_KEY; see env.example)."
-            )
-            print("Dry-run will still scan inputs and compute pending/skipped, but real OCR will fail until you set a real key.")
-        else:
-            raise SystemExit("Missing env var: TYPHOON_API_KEY (or compatible alias: TYPHOON_OCR_API_KEY)")
+    typhoon_api_key = (os.environ.get("TYPHOON_API_KEY") or os.environ.get("TYPHOON_OCR_API_KEY") or "").strip()
+    gemini_api_key = str(args.gemini_api_key or "").strip()
+
+    if provider == "typhoon":
+        if not typhoon_api_key or typhoon_api_key in {"YOUR_KEY_HERE", "CHANGE_ME"}:
+            if args.dry_run:
+                print(
+                    "Warning: missing/placeholder Typhoon API key "
+                    "(set TYPHOON_API_KEY or TYPHOON_OCR_API_KEY; see env.example)."
+                )
+                print("Dry-run will still scan inputs and compute pending/skipped, but real OCR will fail until you set a real key.")
+            else:
+                raise SystemExit("Missing env var: TYPHOON_API_KEY (or compatible alias: TYPHOON_OCR_API_KEY)")
+    elif provider == "gemini":
+        _, validate_gemini_model, resolve_gemini_api_key, _ = _get_gemini_helpers()
+        _ = validate_gemini_model(str(args.model))
+        try:
+            gemini_api_key = resolve_gemini_api_key(gemini_api_key or None)
+        except Exception as e:
+            if args.dry_run:
+                print(f"Warning: {e}")
+                print("Dry-run will still scan inputs and compute pending/skipped, but real OCR will fail until key is set.")
+            else:
+                raise SystemExit(str(e)) from e
 
     if not args.raw_root:
         raise SystemExit("Missing required flag: --raw-root (or legacy alias: --input-root)")
@@ -403,11 +534,29 @@ def main(argv: list[str] | None = None) -> int:
 
         existing_fp = read_existing_fingerprint(out_md)
         if existing_fp == fp:
-            skipped_rows.append({"rel_path": rel, "fingerprint": fp, "status": "skipped", "out_md": str(out_md)})
+            skipped_rows.append(
+                {
+                    "rel_path": rel,
+                    "fingerprint": fp,
+                    "status": "skipped",
+                    "provider": str(provider),
+                    "model": str(args.model),
+                    "out_md": str(out_md),
+                }
+            )
             continue
 
         if (rel, fp) in done_map and out_md.exists():
-            skipped_rows.append({"rel_path": rel, "fingerprint": fp, "status": "skipped", "out_md": str(out_md)})
+            skipped_rows.append(
+                {
+                    "rel_path": rel,
+                    "fingerprint": fp,
+                    "status": "skipped",
+                    "provider": str(provider),
+                    "model": str(args.model),
+                    "out_md": str(out_md),
+                }
+            )
             continue
 
         pending.append((path, rel, fp, out_md))
@@ -422,10 +571,11 @@ def main(argv: list[str] | None = None) -> int:
         pending = pending[: int(args.max_files)]
 
     if args.dry_run:
-        print("Typhoon OCR dry-run preflight (no API calls).")
+        print(f"{provider.title()} OCR dry-run preflight (no API calls).")
         print(f"raw_root: {raw_root}")
         print(f"out_root: {out_root}")
         print(f"manifest_jsonl: {manifest_jsonl}")
+        print(f"provider: {provider}  model: {args.model}")
         print(f"inputs: {len(inputs)}  pending: {len(pending)}  skipped: {len(skipped_rows)}")
         if pending:
             preview_n = min(8, len(pending))
@@ -442,7 +592,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     # Import Typhoon OCR client only when we're actually about to call the API.
-    ocr_document_func = _get_ocr_document()
+    ocr_document_func = _get_ocr_document() if provider == "typhoon" else None
 
     processed = 0
     ok_count = 0
@@ -457,8 +607,10 @@ def main(argv: list[str] | None = None) -> int:
                     rel=rel,
                     fp=fp,
                     out_md=out_md,
+                    provider=str(provider),
                     base_url=str(base_url),
-                    api_key=str(api_key),
+                    typhoon_api_key=str(typhoon_api_key),
+                    gemini_api_key=str(gemini_api_key),
                     model=str(args.model),
                     retries=int(args.retries),
                     retry_base_sleep=float(args.retry_sleep),
@@ -469,7 +621,7 @@ def main(argv: list[str] | None = None) -> int:
 
         total = len(futs)
         tqdm_mod = _get_tqdm() if bool(args.progress) else None
-        pbar = tqdm_mod(total=total, desc="Typhoon OCR", unit="file") if tqdm_mod else None
+        pbar = tqdm_mod(total=total, desc=f"{provider.title()} OCR", unit="file") if tqdm_mod else None
         last_fallback_print = 0.0
 
         stop_early = False
@@ -524,6 +676,7 @@ def main(argv: list[str] | None = None) -> int:
         "raw_root": str(raw_root),
         "out_root": str(out_root),
         "manifest_jsonl": str(manifest_jsonl),
+        "provider": str(provider),
         "model": str(args.model),
         "workers": int(args.workers),
         "max_seconds": int(args.max_seconds),
@@ -555,7 +708,7 @@ def main(argv: list[str] | None = None) -> int:
     _log_line(
         "Done chunk. "
         f"processed={processed} ok={ok_count} error={error_count} skipped={len(skipped_rows)} "
-        f"(workers={args.workers}, model={args.model})"
+        f"(workers={args.workers}, provider={provider}, model={args.model})"
     )
     _log_line(f"Manifest JSONL: {manifest_jsonl}")
     if stats_jsonl is not None:

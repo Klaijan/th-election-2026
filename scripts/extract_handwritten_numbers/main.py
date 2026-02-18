@@ -49,10 +49,14 @@ def _out_dir_for_input(input_root: Path, pdf_path: Path, out_root: Path) -> Path
     Map an input PDF path to an output directory that mirrors the input tree:
       input_root/a/b.pdf -> out_root/a/b/
     """
-    if input_root.is_file():
+    input_is_file = bool(input_root.is_file() or input_root.suffix.lower() == ".pdf")
+    if input_is_file:
         rel = Path(pdf_path.stem)
     else:
-        rel = pdf_path.relative_to(input_root).with_suffix("")
+        try:
+            rel = pdf_path.relative_to(input_root).with_suffix("")
+        except ValueError:
+            rel = Path(pdf_path.stem)
     return out_root / rel
 
 
@@ -157,7 +161,15 @@ def _group_pages_by_document(page_meta: List[Dict[str, Any]]) -> Dict[int, List[
     return docs
 
 
-def process_form(pdf_path: str, output_dir: str = "output", *, debug: bool = False) -> Dict[str, Any]:
+def process_form(
+    pdf_path: str,
+    output_dir: str = "output",
+    *,
+    debug: bool = False,
+    ocr_provider: Optional[str] = None,
+    ocr_model: Optional[str] = None,
+    ocr_api_key: Optional[str] = None,
+) -> Dict[str, Any]:
     """
     Complete pipeline for multi-page form processing.
 
@@ -168,6 +180,8 @@ def process_form(pdf_path: str, output_dir: str = "output", *, debug: bool = Fal
     debug_root = ensure_dir(out_root / "debug_output") if debug else None
 
     timings: Dict[str, float] = {}
+    selected_ocr_provider = str(ocr_provider or config.OCR_PROVIDER).strip().lower()
+    selected_ocr_model = str(ocr_model or config.OCR_MODEL).strip()
 
     def _write_failure_result(err: str) -> Dict[str, Any]:
         """
@@ -178,6 +192,10 @@ def process_form(pdf_path: str, output_dir: str = "output", *, debug: bool = Fal
             "error": str(err),
             "metadata": {
                 "pdf_path": str(pdf_path),
+                "ocr": {
+                    "provider": selected_ocr_provider,
+                    "model": selected_ocr_model,
+                },
                 "pages": None,
                 "processing_time": None,
                 "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -370,7 +388,12 @@ def process_form(pdf_path: str, output_dir: str = "output", *, debug: bool = Fal
             all_regions = field_regions + table_regions
             images = [r.image for r in all_regions]
             ids = [r.region_id for r in all_regions]
-            ocr = OCRProcessor(provider=config.OCR_PROVIDER, languages=config.OCR_LANGUAGES)
+            ocr = OCRProcessor(
+                provider=selected_ocr_provider,
+                languages=config.OCR_LANGUAGES,
+                model=selected_ocr_model,
+                api_key=ocr_api_key,
+            )
             ocr_results = ocr.batch_ocr(images, ids)
         timings["step4_batch_ocr_s"] = float(t.dt or 0.0)
 
@@ -422,6 +445,10 @@ def process_form(pdf_path: str, output_dir: str = "output", *, debug: bool = Fal
                 "pdf_path": str(pdf_path),
                 "pages": int(len(pages)),
                 "total_documents": int(len(doc_results_meta) or 1),
+                "ocr": {
+                    "provider": selected_ocr_provider,
+                    "model": selected_ocr_model,
+                },
                 "processing_time": round(total_s, 3),
                 "timestamp": datetime.now(timezone.utc).isoformat(),
                 "timings": {k: round(float(v), 3) for k, v in timings.items()},
@@ -470,6 +497,9 @@ def process_inputs(
     progress: bool = True,
     force: bool = False,
     max_files: int = 0,
+    ocr_provider: Optional[str] = None,
+    ocr_model: Optional[str] = None,
+    ocr_api_key: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Walk a directory (or process a single file) and run `process_form()` for each PDF.
@@ -504,7 +534,14 @@ def process_inputs(
             continue
 
         try:
-            r = process_form(str(p), str(out_dir), debug=bool(debug))
+            r = process_form(
+                str(p),
+                str(out_dir),
+                debug=bool(debug),
+                ocr_provider=ocr_provider,
+                ocr_model=ocr_model,
+                ocr_api_key=ocr_api_key,
+            )
             # process_form can return a structured failure dict (status="failed") without throwing.
             status = str(r.get("status") or "ok")
             row = {
@@ -550,6 +587,22 @@ def _cli(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--pdf", default=None, help="Alias for --input (backwards compatible).")
     ap.add_argument("--out", default="output", help="Output root directory. Default: output/")
     ap.add_argument("--debug", action="store_true", help="Save intermediate debug images.")
+    ap.add_argument(
+        "--ocr-provider",
+        default=config.OCR_PROVIDER,
+        choices=["google", "gemini", "tesseract"],
+        help="OCR backend provider. Default: config.OCR_PROVIDER",
+    )
+    ap.add_argument(
+        "--ocr-model",
+        default=config.OCR_MODEL,
+        help="Model name used when --ocr-provider=gemini. Default: config.OCR_MODEL",
+    )
+    ap.add_argument(
+        "--ocr-api-key",
+        default="",
+        help="Optional direct API key override for --ocr-provider=gemini.",
+    )
     ap.add_argument("--no-progress", action="store_true", help="Disable progress bar / progress prints.")
     ap.add_argument("--force", action="store_true", help="Reprocess even if output result.json already exists.")
     ap.add_argument("--max-files", type=int, default=0, help="0 = no limit. Otherwise process only first N PDFs found.")
@@ -566,6 +619,9 @@ def _cli(argv: Optional[List[str]] = None) -> int:
         progress=(not bool(args.no_progress)),
         force=bool(args.force),
         max_files=int(args.max_files),
+        ocr_provider=str(args.ocr_provider),
+        ocr_model=str(args.ocr_model),
+        ocr_api_key=str(args.ocr_api_key),
     )
     return 0
 

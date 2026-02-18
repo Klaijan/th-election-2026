@@ -17,6 +17,8 @@ PDF_DPI: int = 400
 # Note: header/fields percent zones are no longer used (zone-1 is inferred via templates 4/5).
 # Keep only table zone for page-1 table guidance.
 TABLE_ZONE = (0.50, 1.0)  # table start and continuation
+# Backward-compatible synthetic test constant.
+FIELD_ZONE = (0.15, 0.50)
 
 # -------------------------
 # Zone 1 (fields) y-range templates (page 1)
@@ -81,6 +83,9 @@ TABLE_MIN_VERT_KERNEL: int = 40
 # -------------------------
 OCR_PROVIDER: str = "google"
 OCR_LANGUAGES: list[str] = ["th", "en"]
+OCR_MODEL: str = "gemini-3-flash"
+OCR_RETRIES: int = 3
+OCR_TIMEOUT_S: float = 90.0
 OCR_CONFIDENCE_THRESHOLD: float = 0.70
 
 # -------------------------
