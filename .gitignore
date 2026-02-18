@@ -15,6 +15,7 @@ __pycache__/
 
 # OS / editor
 .DS_Store
+**/.DS_Store
 
 # Large files (keep out of git)
 /data/
@@ -24,3 +25,8 @@ __pycache__/
 .env
 .env.*
 env.local
+
+!data/ballotlist.csv
+!data/ballotlist_official.xlsx
+!data/cand_clean.csv
+!data/หน่วยเลือกตั้้ง210169.pdf
