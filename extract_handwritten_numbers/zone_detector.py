@@ -476,18 +476,31 @@ class ZoneDetector:
             fn_begin, fn_end = str(pair[0]), str(pair[1])
             t_begin = _load_gray(fn_begin)
             t_end = _load_gray(fn_end)
-            entry: dict = {"tag": str(tag), "files": [fn_begin, fn_end], "loaded": [t_begin is not None, t_end is not None]}
+            entry: dict = {
+                "tag": str(tag),
+                "files": [fn_begin, fn_end],
+                "loaded": [t_begin is not None, t_end is not None],
+            }
             tried.append(entry)
             if t_begin is None or t_end is None:
                 entry["reason"] = "template_missing"
                 return None
 
-            hit_b = self._best_template_hit(gray, t_begin, template_file=str(fn_begin), scales=scales, thr=thr)
-            hit_e = self._best_template_hit(gray, t_end, template_file=str(fn_end), scales=scales, thr=thr)
-            entry["matched"] = [hit_b is not None, hit_e is not None]
-            if hit_b is None or hit_e is None:
-                entry["reason"] = "rejected_or_not_found"
+            # Always compute best score for diagnostics, even if below threshold.
+            best_b = self._best_template_hit_any(gray, t_begin, template_file=str(fn_begin), scales=scales)
+            best_e = self._best_template_hit_any(gray, t_end, template_file=str(fn_end), scales=scales)
+            entry["best"] = [best_b, best_e]
+            acc_b = bool(best_b is not None and float(best_b.get("confidence", 0.0)) >= float(thr))
+            acc_e = bool(best_e is not None and float(best_e.get("confidence", 0.0)) >= float(thr))
+            entry["accepted"] = [bool(acc_b), bool(acc_e)]
+            entry["matched"] = [bool(acc_b), bool(acc_e)]
+            if not (acc_b and acc_e):
+                entry["reason"] = "below_threshold_or_not_found"
                 return None
+
+            # Use the accepted "best" hits.
+            hit_b = best_b
+            hit_e = best_e
 
             y_begin = int(hit_b["bbox"][1])
             y_end2 = int(hit_e["bbox"][1] + hit_e["bbox"][3])
@@ -528,6 +541,33 @@ class ZoneDetector:
         """
         best = None
         best_score = float(thr)
+        for s in scales:
+            tw = max(4, int(round(tmpl.shape[1] * float(s))))
+            th = max(4, int(round(tmpl.shape[0] * float(s))))
+            if tw >= gray_roi.shape[1] or th >= gray_roi.shape[0]:
+                continue
+            t = cv2.resize(tmpl, (tw, th), interpolation=cv2.INTER_AREA if float(s) < 1 else cv2.INTER_CUBIC)
+            res = cv2.matchTemplate(gray_roi, t, cv2.TM_CCOEFF_NORMED)
+            _minv, maxv, _minl, maxl = cv2.minMaxLoc(res)
+            if float(maxv) >= best_score:
+                x, y = int(maxl[0]), int(maxl[1])
+                best_score = float(maxv)
+                best = {
+                    "bbox": [int(x), int(y), int(tw), int(th)],
+                    "confidence": float(maxv),
+                    "scale": float(s),
+                    "template_file": str(template_file),
+                }
+        return best
+
+    @staticmethod
+    def _best_template_hit_any(gray_roi: np.ndarray, tmpl: np.ndarray, *, template_file: str, scales: list[float]) -> dict | None:
+        """
+        Return the single best hit dict for a template across multiple scales, regardless of threshold.
+        Returns None only if the template never fit inside the ROI at any scale.
+        """
+        best = None
+        best_score = float("-inf")
         for s in scales:
             tw = max(4, int(round(tmpl.shape[1] * float(s))))
             th = max(4, int(round(tmpl.shape[0] * float(s))))
