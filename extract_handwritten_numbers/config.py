@@ -38,7 +38,7 @@ ZONE1_TEMPLATE_SEARCH_Y_FRAC: float = 0.65  # search top 65% of the page
 # These anchors define the top/bottom of the "fields" region on first pages.
 REGION_TEMPLATE_FILES_1: tuple[str, str] = ("region_begin.png", "region_end.png")
 REGION_TEMPLATE_FILES_2: tuple[str, str] = ("region_begin_2.png", "region_end_2.png")
-REGION_TEMPLATE_THRESHOLD: float = 0.70
+REGION_TEMPLATE_THRESHOLD: float = 0.60
 # Match debug_template_match.py defaults: 0.50..2.50 step 0.05
 REGION_TEMPLATE_SCALE_RANGE: tuple[float, float, float] = (0.50, 2.50, 0.05)  # (min, max, step)
 # Fallback discrete list (used only if REGION_TEMPLATE_SCALE_RANGE is missing/invalid)
