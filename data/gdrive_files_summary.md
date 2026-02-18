@@ -1,12 +1,12 @@
 # Google Drive Files Summary
 
-Snapshot from `survey_gdrive.py` scans on 2026-02-18.
+Snapshot from `survey_gdrive.py` scans on 2026-02-19.
 
 ## Overview
 
-- **138,437 files** across **74 unique folders** (77 provinces, 71 scanned)
-- **417.15 GB** total size (deduplicated)
-- 4 provinces timed out, 2 missing links, 2 empty folders
+- **170,033 files** across **76 unique folders** (77 provinces, all scanned)
+- **486.44 GB** total size (deduplicated)
+- 2 empty folders (แม่ฮ่องสอน, ระนอง)
 
 ## Tracked reports
 
