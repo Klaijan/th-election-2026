@@ -109,6 +109,96 @@ def _draw_logo_overlay(page_bgr: np.ndarray, *, bbox: list | tuple, confidence: 
     return out
 
 
+def _draw_region_template_diagnostics_overlay(page_bgr: np.ndarray, meta: Dict[str, Any]) -> np.ndarray:
+    """
+    Visualize region_begin/region_end template matching diagnostics on the page.
+
+    This uses `meta["region_templates"]["tried"][].best[]` so you can see best hits even when
+    they were rejected (below threshold / invalid order).
+    """
+    out = page_bgr.copy()
+    h, w = out.shape[:2]
+
+    # Draw search window (same as zone_detector used)
+    z1 = meta.get("zone1_template_search") or {}
+    x_end = int(z1.get("x_end") or w)
+    y_end = int(z1.get("y_end") or h)
+    x_end = max(1, min(x_end, w))
+    y_end = max(1, min(y_end, h))
+    cv2.rectangle(out, (0, 0), (x_end - 1, y_end - 1), (255, 0, 0), 2)
+
+    # Draw zones on top (lets you verify which band we will actually use/skip)
+    try:
+        out = _draw_zones(out, meta.get("zones") or {})
+    except Exception:
+        pass
+
+    rt = meta.get("region_templates") or {}
+    thr = rt.get("threshold", None)
+    method = str(rt.get("method", ""))
+    status = str(rt.get("status", ""))
+    used = rt.get("used_templates") or []
+    cv2.putText(
+        out,
+        f"region_templates: status={status} method={method} thr={thr} used={used}",
+        (10, 40),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.9,
+        (255, 0, 0),
+        2,
+        lineType=cv2.LINE_AA,
+    )
+
+    tried = rt.get("tried") or []
+    y_text = 80
+    for entry in tried:
+        tag = str(entry.get("tag", ""))
+        files = entry.get("files") or ["", ""]
+        accepted = entry.get("accepted") or [False, False]
+        best = entry.get("best") or [None, None]
+        reason = str(entry.get("reason", ""))
+
+        cv2.putText(
+            out,
+            f"{tag} files={files} accepted={accepted} reason={reason}",
+            (10, y_text),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.8,
+            (0, 0, 255) if reason else (0, 180, 0),
+            2,
+            lineType=cv2.LINE_AA,
+        )
+        y_text += 30
+
+        for j in (0, 1):
+            b = best[j] or None
+            if not b:
+                continue
+            try:
+                x, y, bw, bh = b.get("bbox") or (0, 0, 0, 0)
+                x, y, bw, bh = int(x), int(y), int(bw), int(bh)
+                conf = float(b.get("confidence", 0.0))
+                sc = float(b.get("scale", 1.0))
+                tf = str(b.get("template_file", ""))
+            except Exception:
+                continue
+            # bbox is ROI-relative (roi starts at 0,0 on the page)
+            color = (0, 200, 0) if bool(accepted[j]) else (0, 0, 255)
+            cv2.rectangle(out, (x, y), (x + bw, y + bh), color, 3)
+            cv2.putText(
+                out,
+                f"{Path(tf).name} {conf:.3f} s={sc:.2f}",
+                (x, max(20, y - 6)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                color,
+                2,
+                lineType=cv2.LINE_AA,
+            )
+
+    return out
+
+
 def structure_results(
     field_regions: List[ExtractedRegion],
     table_regions: List[ExtractedRegion],
@@ -169,6 +259,7 @@ def process_form(pdf_path: str, output_dir: str = "output", *, debug: bool = Fal
 
     timings: Dict[str, float] = {}
     step2_detail: Dict[str, Any] = {}
+    manual_review: List[Dict[str, Any]] = []
 
     def _write_failure_result(err: str) -> Dict[str, Any]:
         """
@@ -271,9 +362,17 @@ def process_form(pdf_path: str, output_dir: str = "output", *, debug: bool = Fal
                     # region_begin/end hits on logo-detected pages (by design).
                     save_image(
                         debug_root / f"page_{p:02d}_doc_{did0+1:02d}_page_{doc_local:02d}_region_templates_detected.jpg",
-                        zone_detector.visualize_zone1_template_hits(
-                            img, m.get("zone1_template_hits") or [], search_zone, search_x
+                        _draw_zones(
+                            zone_detector.visualize_zone1_template_hits(
+                                img, m.get("zone1_template_hits") or [], search_zone, search_x
+                            ),
+                            m.get("zones") or {},
                         ),
+                    )
+                    # Best-hit diagnostics overlay (shows best matches even if rejected)
+                    save_image(
+                        debug_root / f"page_{p:02d}_doc_{did0+1:02d}_page_{doc_local:02d}_region_templates_best_overlay.jpg",
+                        _draw_region_template_diagnostics_overlay(img, m),
                     )
                     save_image(
                         debug_root / f"page_{p:02d}_zone1_fields_zone.jpg",
@@ -288,6 +387,11 @@ def process_form(pdf_path: str, output_dir: str = "output", *, debug: bool = Fal
         doc_results_meta: List[Dict[str, Any]] = []
         field_regions: List[ExtractedRegion] = []
         table_regions: List[ExtractedRegion] = []
+        dot_debug_summary: List[Dict[str, Any]] = []
+        processed_pages: set[int] = set()
+        table_page_times: List[float] = []
+        table_pages_attempted: int = 0
+        table_pages_failed: int = 0
 
         with Timer("extract_all_documents") as t_extract:
             for did, doc_pages in sorted(docs.items(), key=lambda kv: int(kv[0])):
@@ -300,6 +404,23 @@ def process_form(pdf_path: str, output_dir: str = "output", *, debug: bool = Fal
 
                 log.info("Processing document %d: pages=%s first_page=%d", int(did), [int(m["page_num"]) + 1 for m in doc_pages], first_idx + 1)
 
+                # Manual review flag: logo page but region templates didn't yield a fields band.
+                rt = first_meta.get("region_templates") or {}
+                if bool(first_meta.get("logo_detected", False)) and str(rt.get("status", "")) != "ok":
+                    msg = (
+                        f"Manual review needed: pdf={pdf_path} doc={int(did)} first_page={first_idx+1} "
+                        f"region_templates_status={rt.get('status')} used={rt.get('used_templates')}"
+                    )
+                    log.warning(msg)
+                    manual_review.append(
+                        {
+                            "document_id": int(did),
+                            "first_page": int(first_idx),
+                            "reason": "region_templates_failed",
+                            "region_templates": rt,
+                        }
+                    )
+
                 # Fields (only on first page)
                 doc_field_regions: List[ExtractedRegion] = []
                 if bool(first_meta.get("has_fields", False)):
@@ -308,6 +429,7 @@ def process_form(pdf_path: str, output_dir: str = "output", *, debug: bool = Fal
                     fe = FieldExtractor(remove_dots=True)
                     doc_field_regions = fe.extract_fields(pages[first_idx], field_zone, debug=debug, region_id_prefix=prefix)
                     field_regions.extend(doc_field_regions)
+                    processed_pages.add(int(first_idx))
 
                     if debug_root is not None:
                         dot_det = DotDetector()
@@ -316,9 +438,52 @@ def process_form(pdf_path: str, output_dir: str = "output", *, debug: bool = Fal
                             debug_root / f"page_{int(first_idx)+1:02d}_dots_detected.jpg",
                             dot_det.visualize_detection(pages[first_idx], dotted, field_zone),
                         )
+                        dot_debug_summary.append(
+                            {
+                                "kind": "fields_first_page",
+                                "document_id": int(did),
+                                "page_num": int(first_idx),
+                                "zone": [int(field_zone[0]), int(field_zone[1])],
+                                "dotted_lines": int(len(dotted)),
+                            }
+                        )
                         for r in doc_field_regions:
                             save_image(debug_root / f"{r.region_id}_raw.jpg", r.raw_image)
                             save_image(debug_root / f"{r.region_id}_preprocessed.jpg", r.image)
+
+                # Debug-only: run dot detection on every logo-detected page (using inferred fields band)
+                # and on every table page (restricted to the last-column ROI).
+                if debug_root is not None:
+                    dot_det = DotDetector()
+                    for doc_local_idx, m in enumerate(doc_pages, start=1):
+                        page_num = int(m.get("page_num", 0))
+                        img = pages[page_num]
+
+                        # (A) Pages with logo: run dot detection within the inferred fields band.
+                        if bool(m.get("logo_detected", False)):
+                            fz = (m.get("zones") or {}).get("fields") or (0, 0)
+                            try:
+                                y0, y1 = int(fz[0]), int(fz[1])
+                            except Exception:
+                                y0, y1 = 0, 0
+                            if y1 > y0:
+                                dotted = dot_det.detect_dotted_lines(img, (int(y0), int(y1)))
+                                save_image(
+                                    debug_root
+                                    / f"page_{page_num+1:02d}_doc_{int(did)+1:02d}_page_{int(doc_local_idx):02d}_fields_dots_detected.jpg",
+                                    dot_det.visualize_detection(img, dotted, (int(y0), int(y1))),
+                                )
+                                dot_debug_summary.append(
+                                    {
+                                        "kind": "fields_logo_page",
+                                        "document_id": int(did),
+                                        "page_num": int(page_num),
+                                        "doc_page_index": int(doc_local_idx),
+                                        "zone": [int(y0), int(y1)],
+                                        "dotted_lines": int(len(dotted)),
+                                        "region_templates_status": (m.get("region_templates") or {}).get("status"),
+                                    }
+                                )
 
                 # Tables (all pages in doc)
                 td = TableDetector()
@@ -332,14 +497,36 @@ def process_form(pdf_path: str, output_dir: str = "output", *, debug: bool = Fal
                     page_num = int(m.get("page_num", 0))
                     if not bool(m.get("has_table", False)):
                         continue
+                    processed_pages.add(int(page_num))
                     img = pages[page_num]
                     zone = m["zones"]["table"]
+                    import time
+
+                    t0_page = time.perf_counter()
+                    table_pages_attempted += 1
                     try:
                         bbox = td.detect_table_boundary(img, zone)
                         struct = td.parse_table_structure(img, bbox)
-                    except (ValueError, IndexError) as exc:
-                        log.warning("Table detection failed on page %d: %s — skipping", page_num + 1, exc)
+                    except Exception as e:
+                        table_pages_failed += 1
+                        manual_review.append(
+                            {
+                                "document_id": int(did),
+                                "page": int(page_num),
+                                "reason": "table_detection_failed",
+                                "error": str(e),
+                            }
+                        )
+                        log.warning(
+                            "Manual review needed: pdf=%s doc=%d page=%d table detection failed (%s). Skipping table extraction for this page.",
+                            str(pdf_path),
+                            int(did),
+                            int(page_num) + 1,
+                            str(e),
+                        )
                         continue
+                    finally:
+                        table_page_times.append(float(time.perf_counter() - t0_page))
 
                     if bool(m.get("is_first_page", False)):
                         target_col = struct.target_column
@@ -368,6 +555,47 @@ def process_form(pdf_path: str, output_dir: str = "output", *, debug: bool = Fal
                             save_image(debug_root / f"{r.region_id}_raw.jpg", r.raw_image)
                             save_image(debug_root / f"{r.region_id}_preprocessed.jpg", r.image)
 
+                    # Debug-only: dot detection within last-column ROI (for table pages).
+                    if debug_root is not None:
+                        try:
+                            x0, x1 = (int(struct.target_column[0]), int(struct.target_column[1]))
+                            y0, y1 = (int(struct.bbox.y), int(struct.bbox.y2))
+                            h, w = img.shape[:2]
+                            x0 = max(0, min(x0, w))
+                            x1 = max(0, min(x1, w))
+                            y0 = max(0, min(y0, h))
+                            y1 = max(0, min(y1, h))
+                            if x1 > x0 and y1 > y0:
+                                roi = img[y0:y1, x0:x1].copy()
+                                dotted = dot_det.detect_dotted_lines(roi, (0, int(roi.shape[0])))
+                                roi_overlay = dot_det.visualize_detection(roi, dotted, (0, int(roi.shape[0])))
+                                overlay = img.copy()
+                                overlay[y0:y1, x0:x1] = roi_overlay
+                                cv2.rectangle(overlay, (x0, y0), (x1, y1), (255, 0, 255), 4)
+                                # doc-local index for this page within the document (1-based)
+                                doc_local_idx = 1
+                                try:
+                                    doc_local_idx = int([int(mm.get("page_num", 0)) for mm in doc_pages].index(int(page_num)) + 1)
+                                except Exception:
+                                    doc_local_idx = 1
+                                save_image(
+                                    debug_root
+                                    / f"page_{page_num+1:02d}_doc_{int(did)+1:02d}_page_{int(doc_local_idx):02d}_table_lastcol_dots_detected.jpg",
+                                    overlay,
+                                )
+                                dot_debug_summary.append(
+                                    {
+                                        "kind": "table_lastcol",
+                                        "document_id": int(did),
+                                        "page_num": int(page_num),
+                                        "doc_page_index": int(doc_local_idx),
+                                        "roi": [int(x0), int(y0), int(x1 - x0), int(y1 - y0)],
+                                        "dotted_lines": int(len(dotted)),
+                                    }
+                                )
+                        except Exception:
+                            pass
+
                 table_regions.extend(doc_table_regions)
 
                 doc_results_meta.append(
@@ -377,6 +605,10 @@ def process_form(pdf_path: str, output_dir: str = "output", *, debug: bool = Fal
                         "first_page": int(first_idx),
                         "logo_detected": bool(first_meta.get("logo_detected", False)),
                         "logo_confidence": float(first_meta.get("logo_confidence", 0.0) or 0.0),
+                        "needs_manual_review": bool(
+                            bool(first_meta.get("logo_detected", False))
+                            and str((first_meta.get("region_templates") or {}).get("status", "")) != "ok"
+                        ),
                         "extractions": {"fields": int(len(doc_field_regions)), "table_column_3": int(len(doc_table_regions))},
                     }
                 )
@@ -435,15 +667,37 @@ def process_form(pdf_path: str, output_dir: str = "output", *, debug: bool = Fal
         timings["step5_validation_s"] = float(t.dt or 0.0)
 
         total_s = float(sum(timings.values()))
+        # Summary stats
+        total_pages = int(len(pages))
+        total_docs = int(len(doc_results_meta) or 1)
+        avg_s_per_page = float(total_s / max(1, total_pages))
+        timings["avg_total_s_per_page"] = float(avg_s_per_page)
+        timings["avg_step2_zone_detection_s_per_page"] = float(timings.get("step2_zone_detection_s", 0.0) / max(1, total_pages))
+        timings["avg_step3_extraction_s_per_page"] = float(timings.get("step3_extract_all_documents_s", 0.0) / max(1, total_pages))
+        if table_page_times:
+            timings["avg_table_detection_s_per_table_page"] = float(sum(table_page_times) / max(1, len(table_page_times)))
+        log.info("Docs found: %d", total_docs)
+        log.info("Pages: %d  processed_pages: %d", total_pages, int(len(processed_pages)))
+        log.info("Avg total time: %.3fs/page", avg_s_per_page)
+        if table_page_times:
+            log.info(
+                "Table detection: attempted=%d failed=%d avg=%.3fs/table-page",
+                int(table_pages_attempted),
+                int(table_pages_failed),
+                float(sum(table_page_times) / max(1, len(table_page_times))),
+            )
         result: Dict[str, Any] = {
             "metadata": {
                 "pdf_path": str(pdf_path),
                 "pages": int(len(pages)),
+                "pages_processed": int(len(processed_pages)),
                 "total_documents": int(len(doc_results_meta) or 1),
                 "processing_time": round(total_s, 3),
+                "avg_total_s_per_page": float(avg_s_per_page),
                 "timestamp": datetime.now(timezone.utc).isoformat(),
                 "timings": {k: round(float(v), 3) for k, v in timings.items()},
                 "step2_zone_detection_detail": step2_detail,
+                "manual_review": manual_review,
                 "extractions": {
                     "fields": len(field_regions),
                     "table_column_3": len(table_regions),
@@ -464,6 +718,7 @@ def process_form(pdf_path: str, output_dir: str = "output", *, debug: bool = Fal
         if debug_root is not None:
             save_json(debug_root / "timing_breakdown.json", timings)
             save_json(debug_root / "ocr_results.json", {k: v.__dict__ for k, v in ocr_results.items()})
+            save_json(debug_root / "dot_detection_summary.json", dot_debug_summary)
 
         log.info("Step 1: Loaded %d pages (%.3fs)", len(pages), timings.get("step1_load_pdf_s", 0.0))
         log.info(

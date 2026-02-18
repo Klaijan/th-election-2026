@@ -98,6 +98,9 @@ class ZoneDetector:
                         region_status = {
                             **(region_status or {}),
                             "status": "fallback_zone1_templates",
+                            "method": "zone1_templates",
+                            "used_templates": [str(h.get("template_file", "")) for h in (hits2 or []) if str(h.get("template_file", ""))],
+                            "threshold": float(getattr(config, "ZONE1_TEMPLATE_THRESHOLD", 0.60)),
                         }
                         # Update search window metadata to match the fallback method.
                         y_end = int(y_end2)
@@ -219,7 +222,13 @@ class ZoneDetector:
                 header_y1 = int(round(float(h) * float(getattr(config, "LOGO_SEARCH_Y_FRAC", 0.20))))
                 header_y1 = max(1, min(header_y1, h))
                 header = (0, int(header_y1))
-                table = self._zone_px(h, config.TABLE_ZONE)
+                # Table search zone:
+                # - If logo was actually detected on this page, restrict to lower 50% (avoid header artifacts).
+                # - If this is a forced first page without logo, search whole page (more robust).
+                if bool(hit.get("has_logo", False)):
+                    table = (int(round(0.50 * float(h))), int(h))
+                else:
+                    table = (0, int(h))
                 y_end = int(
                     round(float(h) * float(getattr(config, "REGION_TEMPLATE_SEARCH_Y_FRAC", getattr(config, "ZONE1_TEMPLATE_SEARCH_Y_FRAC", 0.65))))
                 )
@@ -237,27 +246,16 @@ class ZoneDetector:
                 )
                 region_time_total += float(time.perf_counter() - t0)
                 n_region_pages += 1
-                # Fallback: if region templates fail, try zone-1 templates (template_4/template_5).
-                # This helps when region anchors are missing on some first pages, while still avoiding
-                # overly broad dot detection that can create false positives.
-                if fields == (0, 0):
-                    y_end2 = int(round(float(h) * float(getattr(config, "ZONE1_TEMPLATE_SEARCH_Y_FRAC", 0.65))))
-                    y_end2 = max(1, min(y_end2, h))
-                    x_end2 = int(round(float(w) * float(getattr(config, "ZONE1_TEMPLATE_SEARCH_X_FRAC", 0.5))))
-                    x_end2 = max(1, min(x_end2, w))
-                    fields2, hits2 = self._infer_fields_zone_from_zone1_templates(
-                        page, search_zone=(0, int(y_end2)), search_x_end=int(x_end2)
-                    )
-                    if fields2 != (0, 0):
-                        fields = fields2
-                        zone1_hits = hits2
-                        region_status = {**(region_status or {}), "status": "fallback_zone1_templates"}
-                        y_end = int(y_end2)
-                        x_end = int(x_end2)
             else:
                 header = (0, 0)
                 fields = (0, 0)
-                table = (0, h)
+                # Table search zone:
+                # - If logo is detected on this page, restrict to lower 50% (avoid header artifacts).
+                # - Otherwise, search whole page.
+                if bool(hit.get("has_logo", False)):
+                    table = (int(round(0.50 * float(h))), int(h))
+                else:
+                    table = (0, int(h))
                 zone1_hits = []
                 x_end = 0
                 y_end = 0
@@ -462,18 +460,31 @@ class ZoneDetector:
             fn_begin, fn_end = str(pair[0]), str(pair[1])
             t_begin = _load_gray(fn_begin)
             t_end = _load_gray(fn_end)
-            entry: dict = {"tag": str(tag), "files": [fn_begin, fn_end], "loaded": [t_begin is not None, t_end is not None]}
+            entry: dict = {
+                "tag": str(tag),
+                "files": [fn_begin, fn_end],
+                "loaded": [t_begin is not None, t_end is not None],
+            }
             tried.append(entry)
             if t_begin is None or t_end is None:
                 entry["reason"] = "template_missing"
                 return None
 
-            hit_b = self._best_template_hit(gray, t_begin, template_file=str(fn_begin), scales=scales, thr=thr)
-            hit_e = self._best_template_hit(gray, t_end, template_file=str(fn_end), scales=scales, thr=thr)
-            entry["matched"] = [hit_b is not None, hit_e is not None]
-            if hit_b is None or hit_e is None:
-                entry["reason"] = "rejected_or_not_found"
+            # Always compute best score for diagnostics, even if below threshold.
+            best_b = self._best_template_hit_any(gray, t_begin, template_file=str(fn_begin), scales=scales)
+            best_e = self._best_template_hit_any(gray, t_end, template_file=str(fn_end), scales=scales)
+            entry["best"] = [best_b, best_e]
+            acc_b = bool(best_b is not None and float(best_b.get("confidence", 0.0)) >= float(thr))
+            acc_e = bool(best_e is not None and float(best_e.get("confidence", 0.0)) >= float(thr))
+            entry["accepted"] = [bool(acc_b), bool(acc_e)]
+            entry["matched"] = [bool(acc_b), bool(acc_e)]
+            if not (acc_b and acc_e):
+                entry["reason"] = "below_threshold_or_not_found"
                 return None
+
+            # Use the accepted "best" hits.
+            hit_b = best_b
+            hit_e = best_e
 
             y_begin = int(hit_b["bbox"][1])
             y_end2 = int(hit_e["bbox"][1] + hit_e["bbox"][3])
@@ -500,10 +511,38 @@ class ZoneDetector:
                 used = "set2"
 
         if got is None:
-            return (0, 0), [], {"status": "none", "used": None, "threshold": float(thr), "scales": list(scales), "tried": tried}
+            return (
+                (0, 0),
+                [],
+                {
+                    "status": "none",
+                    "method": "region_templates",
+                    "used": None,
+                    "used_templates": [],
+                    "threshold": float(thr),
+                    "scales": list(scales),
+                    "tried": tried,
+                },
+            )
 
         band, hits = got
-        return band, hits, {"status": "ok", "used": used, "threshold": float(thr), "scales": list(scales), "tried": tried}
+        if used == "set2":
+            used_files = [str(files2[0]), str(files2[1])]
+        else:
+            used_files = [str(files1[0]), str(files1[1])]
+        return (
+            band,
+            hits,
+            {
+                "status": "ok",
+                "method": "region_templates",
+                "used": used,
+                "used_templates": list(used_files),
+                "threshold": float(thr),
+                "scales": list(scales),
+                "tried": tried,
+            },
+        )
 
     @staticmethod
     def _best_template_hit(
@@ -514,6 +553,33 @@ class ZoneDetector:
         """
         best = None
         best_score = float(thr)
+        for s in scales:
+            tw = max(4, int(round(tmpl.shape[1] * float(s))))
+            th = max(4, int(round(tmpl.shape[0] * float(s))))
+            if tw >= gray_roi.shape[1] or th >= gray_roi.shape[0]:
+                continue
+            t = cv2.resize(tmpl, (tw, th), interpolation=cv2.INTER_AREA if float(s) < 1 else cv2.INTER_CUBIC)
+            res = cv2.matchTemplate(gray_roi, t, cv2.TM_CCOEFF_NORMED)
+            _minv, maxv, _minl, maxl = cv2.minMaxLoc(res)
+            if float(maxv) >= best_score:
+                x, y = int(maxl[0]), int(maxl[1])
+                best_score = float(maxv)
+                best = {
+                    "bbox": [int(x), int(y), int(tw), int(th)],
+                    "confidence": float(maxv),
+                    "scale": float(s),
+                    "template_file": str(template_file),
+                }
+        return best
+
+    @staticmethod
+    def _best_template_hit_any(gray_roi: np.ndarray, tmpl: np.ndarray, *, template_file: str, scales: list[float]) -> dict | None:
+        """
+        Return the single best hit dict for a template across multiple scales, regardless of threshold.
+        Returns None only if the template never fit inside the ROI at any scale.
+        """
+        best = None
+        best_score = float("-inf")
         for s in scales:
             tw = max(4, int(round(tmpl.shape[1] * float(s))))
             th = max(4, int(round(tmpl.shape[0] * float(s))))
