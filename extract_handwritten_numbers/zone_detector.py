@@ -596,6 +596,6 @@ class ZoneDetector:
             elif dy >= 140 and dx <= 6:
                 vert += 1
 
-        return (horiz >= 3) and (vert >= 2)
+        return (horiz >= 3) and (vert >= 3)
 
 

@@ -334,8 +334,12 @@ def process_form(pdf_path: str, output_dir: str = "output", *, debug: bool = Fal
                         continue
                     img = pages[page_num]
                     zone = m["zones"]["table"]
-                    bbox = td.detect_table_boundary(img, zone)
-                    struct = td.parse_table_structure(img, bbox)
+                    try:
+                        bbox = td.detect_table_boundary(img, zone)
+                        struct = td.parse_table_structure(img, bbox)
+                    except (ValueError, IndexError) as exc:
+                        log.warning("Table detection failed on page %d: %s — skipping", page_num + 1, exc)
+                        continue
 
                     if bool(m.get("is_first_page", False)):
                         target_col = struct.target_column
