@@ -89,6 +89,17 @@ class ZoneDetector:
                         # Update search window metadata to match the fallback method.
                         y_end = int(y_end2)
                         x_end = int(x_end2)
+                # Final fallback: fixed band (conservative) for first pages only.
+                if fields == (0, 0) and bool(getattr(config, "FIELDS_FALLBACK_ENABLED", True)):
+                    a, b = getattr(config, "FIELDS_FALLBACK_Y_FRAC", (0.35, 0.78))
+                    yy0 = int(round(float(h) * float(a)))
+                    yy1 = int(round(float(h) * float(b)))
+                    yy0 = max(0, min(yy0, h))
+                    yy1 = max(0, min(yy1, h))
+                    if yy1 > yy0:
+                        fields = (int(yy0), int(yy1))
+                        zone1_hits = []
+                        region_status = {**(region_status or {}), "status": "fallback_fixed_band"}
             else:
                 # Continuation pages: treat as table-only (full page).
                 header = (0, 0)
@@ -241,6 +252,17 @@ class ZoneDetector:
                         region_status = {**(region_status or {}), "status": "fallback_zone1_templates"}
                         y_end = int(y_end2)
                         x_end = int(x_end2)
+                # Final fallback: fixed band (conservative) for first pages only.
+                if fields == (0, 0) and bool(getattr(config, "FIELDS_FALLBACK_ENABLED", True)):
+                    a, b = getattr(config, "FIELDS_FALLBACK_Y_FRAC", (0.35, 0.78))
+                    yy0 = int(round(float(h) * float(a)))
+                    yy1 = int(round(float(h) * float(b)))
+                    yy0 = max(0, min(yy0, h))
+                    yy1 = max(0, min(yy1, h))
+                    if yy1 > yy0:
+                        fields = (int(yy0), int(yy1))
+                        zone1_hits = []
+                        region_status = {**(region_status or {}), "status": "fallback_fixed_band"}
             else:
                 header = (0, 0)
                 fields = (0, 0)

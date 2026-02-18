@@ -129,4 +129,14 @@ ALWAYS_TREAT_PAGE0_AS_FIRST: bool = True
 # If two detected logos are too close, treat the later one as suspicious (helps false positives).
 LOGO_MIN_PAGE_GAP: int = 1
 
+# -------------------------
+# Fields-zone fallback (for first pages when templates fail)
+# -------------------------
+# When both region templates and zone1 templates fail to define a fields band on a first page,
+# we can still try a conservative fixed y-band so dotted-line detection has a chance to run.
+# If no dotted lines exist, FieldExtractor will simply return zero regions.
+FIELDS_FALLBACK_ENABLED: bool = True
+# Fraction of page height (y0,y1) used as fallback for FIRST pages only.
+FIELDS_FALLBACK_Y_FRAC: tuple[float, float] = (0.35, 0.78)
+
 
