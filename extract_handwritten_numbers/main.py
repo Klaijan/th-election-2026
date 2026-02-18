@@ -247,7 +247,7 @@ def _group_pages_by_document(page_meta: List[Dict[str, Any]]) -> Dict[int, List[
     return docs
 
 
-def process_form(pdf_path: str, output_dir: str = "output", *, debug: bool = False) -> Dict[str, Any]:
+def process_form(pdf_path: str, output_dir: str = "output", *, debug: bool = False, ocr_provider: Optional[str] = None) -> Dict[str, Any]:
     """
     Complete pipeline for multi-page form processing.
 
@@ -620,7 +620,7 @@ def process_form(pdf_path: str, output_dir: str = "output", *, debug: bool = Fal
             all_regions = field_regions + table_regions
             images = [r.image for r in all_regions]
             ids = [r.region_id for r in all_regions]
-            ocr = OCRProcessor(provider=config.OCR_PROVIDER, languages=config.OCR_LANGUAGES)
+            ocr = OCRProcessor(provider=ocr_provider or config.OCR_PROVIDER, languages=config.OCR_LANGUAGES)
             ocr_results = ocr.batch_ocr(images, ids)
         timings["step4_batch_ocr_s"] = float(t.dt or 0.0)
 
@@ -744,6 +744,7 @@ def process_inputs(
     progress: bool = True,
     force: bool = False,
     max_files: int = 0,
+    ocr_provider: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Walk a directory (or process a single file) and run `process_form()` for each PDF.
@@ -778,7 +779,7 @@ def process_inputs(
             continue
 
         try:
-            r = process_form(str(p), str(out_dir), debug=bool(debug))
+            r = process_form(str(p), str(out_dir), debug=bool(debug), ocr_provider=ocr_provider)
             # process_form can return a structured failure dict (status="failed") without throwing.
             status = str(r.get("status") or "ok")
             row = {
@@ -824,6 +825,8 @@ def _cli(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--pdf", default=None, help="Alias for --input (backwards compatible).")
     ap.add_argument("--out", default="output", help="Output root directory. Default: output/")
     ap.add_argument("--debug", action="store_true", help="Save intermediate debug images.")
+    ap.add_argument("--ocr-provider", default=None, choices=["google", "tesseract"],
+                     help="OCR provider override. Default: config value (google).")
     ap.add_argument("--no-progress", action="store_true", help="Disable progress bar / progress prints.")
     ap.add_argument("--force", action="store_true", help="Reprocess even if output result.json already exists.")
     ap.add_argument("--max-files", type=int, default=0, help="0 = no limit. Otherwise process only first N PDFs found.")
@@ -840,6 +843,7 @@ def _cli(argv: Optional[List[str]] = None) -> int:
         progress=(not bool(args.no_progress)),
         force=bool(args.force),
         max_files=int(args.max_files),
+        ocr_provider=args.ocr_provider,
     )
     return 0
 
