@@ -19,5 +19,8 @@ pandas>=2.2.0
 # Optional OCR fallback (requires system tesseract binary)
 pytesseract>=0.3.10
 
+# Gemini Vision extraction (run_gemini_extract.py)
+google-generativeai>=0.8.0
+
 # Tests
 pytest>=8.2.0
