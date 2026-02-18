@@ -1,13 +1,17 @@
 #!/usr/bin/env python3
-"""Survey Google Drive folder sizes for all provinces via rclone.
+"""Survey Google Drive province folders via rclone.
 
-Scans province folders on Google Drive using ``rclone size --json`` and
-produces a terminal report, with optional CSV and JSON outputs.
+Unified CLI with three subcommands:
+
+* **size**   — measure folder sizes (``rclone size --json``)
+* **files**  — list every file (``rclone lsjson -R``)
+* **owners** — identify folder owners (``rclone lsjson -M``)
 
 Usage::
 
-    python scripts/survey_gdrive.py [--workers 10] [--output-dir data/] \
-        [--csv] [--json] [--timeout 120]
+    python scripts/survey_gdrive.py size  [--csv] [--json] [--cand-csv ...]
+    python scripts/survey_gdrive.py files [--workers 5] [--timeout 600]
+    python scripts/survey_gdrive.py owners
 """
 
 from __future__ import annotations
@@ -17,7 +21,6 @@ import csv
 import json
 import math
 import os
-import re
 import subprocess
 import sys
 import time
@@ -26,74 +29,19 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
-
-# ---------------------------------------------------------------------------
-# tqdm with fallback
-# ---------------------------------------------------------------------------
-
-def _get_tqdm():
-    try:
-        from tqdm import tqdm  # type: ignore
-        return tqdm
-    except Exception:
-        return None
-
-
-def _fallback_progress(done: int, total: int, width: int = 28) -> str:
-    total = max(1, int(total))
-    done = max(0, min(int(done), total))
-    filled = int(round(width * (done / total)))
-    bar = "=" * filled + "-" * (width - filled)
-    return f"[{bar}] {done}/{total}"
+from gdrive_utils import (
+    PROVINCE_TO_REGION,
+    REGION_NAMES,
+    atomic_write_text,
+    fallback_progress,
+    get_tqdm,
+    human_bytes,
+    parse_province_links,
+)
 
 
 # ---------------------------------------------------------------------------
-# Region mapping (6 regions, 77 provinces)
-# ---------------------------------------------------------------------------
-
-PROVINCE_TO_REGION: dict[str, str] = {}
-
-_REGION_PROVINCES: dict[str, list[str]] = {
-    "ภาคกลาง": [
-        "กรุงเทพมหานคร", "สมุทรปราการ", "นนทบุรี", "ปทุมธานี",
-        "พระนครศรีอยุธยา", "อ่างทอง", "ลพบุรี", "สิงห์บุรี",
-        "ชัยนาท", "สระบุรี", "นครปฐม", "สมุทรสาคร", "สมุทรสงคราม",
-    ],
-    "ภาคตะวันออก": [
-        "ชลบุรี", "ระยอง", "จันทบุรี", "ตราด",
-        "ฉะเชิงเทรา", "ปราจีนบุรี", "นครนายก", "สระแก้ว",
-    ],
-    "ภาคอีสาน": [
-        "นครราชสีมา", "บุรีรัมย์", "สุรินทร์", "ศรีสะเกษ",
-        "อุบลราชธานี", "ยโสธร", "ชัยภูมิ", "อำนาจเจริญ",
-        "บึงกาฬ", "หนองบัวลำภู", "ขอนแก่น", "อุดรธานี",
-        "เลย", "หนองคาย", "มหาสารคาม", "ร้อยเอ็ด",
-        "กาฬสินธุ์", "สกลนคร", "นครพนม", "มุกดาหาร",
-    ],
-    "ภาคเหนือ": [
-        "เชียงใหม่", "ลำพูน", "ลำปาง", "อุตรดิตถ์", "แพร่",
-        "น่าน", "พะเยา", "เชียงราย", "แม่ฮ่องสอน",
-        "นครสวรรค์", "อุทัยธานี", "กำแพงเพชร", "ตาก",
-        "สุโขทัย", "พิษณุโลก", "พิจิตร", "เพชรบูรณ์",
-    ],
-    "ภาคตะวันตก": [
-        "ราชบุรี", "กาญจนบุรี", "สุพรรณบุรี", "เพชรบุรี",
-        "ประจวบคีรีขันธ์",
-    ],
-    "ภาคใต้": [
-        "นครศรีธรรมราช", "กระบี่", "พังงา", "ภูเก็ต",
-        "สุราษฎร์ธานี", "ระนอง", "ชุมพร", "สงขลา",
-        "สตูล", "ตรัง", "พัทลุง", "ปัตตานี", "ยะลา", "นราธิวาส",
-    ],
-}
-
-for _region, _provs in _REGION_PROVINCES.items():
-    for _p in _provs:
-        PROVINCE_TO_REGION[_p] = _region
-
-
-# ---------------------------------------------------------------------------
-# Data models
+# Data models (size command)
 # ---------------------------------------------------------------------------
 
 @dataclass
@@ -119,33 +67,9 @@ class SurveyReport:
     size_distribution: dict[str, int] = field(default_factory=dict)
 
 
-# ---------------------------------------------------------------------------
-# Parsing
-# ---------------------------------------------------------------------------
-
-_FOLDER_ID_RE = re.compile(r"folders/([a-zA-Z0-9_-]+)")
-
-
-def parse_province_links(path: Path) -> list[dict]:
-    """Read province_links.csv (utf-8-sig BOM) and extract folder IDs."""
-    rows: list[dict] = []
-    with open(path, encoding="utf-8-sig", newline="") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            province = row["province"].strip()
-            url = (row.get("folder_url") or "").strip()
-            folder_id = ""
-            if url:
-                m = _FOLDER_ID_RE.search(url)
-                if m:
-                    folder_id = m.group(1)
-            rows.append({
-                "province": province,
-                "folder_url": url,
-                "folder_id": folder_id,
-            })
-    return rows
-
+# ===================================================================
+# Size command helpers
+# ===================================================================
 
 def load_constituency_counts(path: Path) -> dict[str, int]:
     """Parse cand_clean.csv and count unique constituencies per province."""
@@ -160,15 +84,11 @@ def load_constituency_counts(path: Path) -> dict[str, int]:
 
 
 # ---------------------------------------------------------------------------
-# rclone
+# rclone: size
 # ---------------------------------------------------------------------------
 
 def rclone_size(folder_id: str, timeout: int = 120, remote: str = "gdrive:") -> dict:
-    """Run ``rclone size --json`` on a Google Drive folder.
-
-    Returns dict with ``count`` and ``bytes`` on success, or
-    ``error`` key on failure.
-    """
+    """Run ``rclone size --json`` on a Google Drive folder."""
     try:
         result = subprocess.run(
             [
@@ -197,7 +117,7 @@ def rclone_size(folder_id: str, timeout: int = 120, remote: str = "gdrive:") -> 
 
 
 # ---------------------------------------------------------------------------
-# Anomaly detection
+# Anomaly detection (size command)
 # ---------------------------------------------------------------------------
 
 def detect_anomalies(provinces: list[ProvinceSize]) -> list[dict]:
@@ -258,20 +178,8 @@ def detect_anomalies(provinces: list[ProvinceSize]) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
-# Formatting helpers
+# Size formatting helpers
 # ---------------------------------------------------------------------------
-
-def human_bytes(n: int) -> str:
-    """Format bytes as human-readable string."""
-    if n == 0:
-        return "0 B"
-    units = ["B", "KB", "MB", "GB", "TB"]
-    exp = min(int(math.log(abs(n), 1024)), len(units) - 1)
-    val = n / (1024 ** exp)
-    if exp == 0:
-        return f"{int(val)} B"
-    return f"{val:.2f} {units[exp]}"
-
 
 _SIZE_BUCKETS = [
     ("0 B", 0),
@@ -296,7 +204,7 @@ def _bucket_label(total_bytes: int) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Report building
+# Size report building
 # ---------------------------------------------------------------------------
 
 def build_report(
@@ -360,7 +268,7 @@ def build_report(
 
 
 # ---------------------------------------------------------------------------
-# Terminal report
+# Size terminal report
 # ---------------------------------------------------------------------------
 
 def format_terminal_report(report: SurveyReport) -> str:
@@ -406,7 +314,7 @@ def format_terminal_report(report: SurveyReport) -> str:
     lines.append("-" * 60)
     lines.append(f"  {'Region':<20} {'Provinces':>9} {'Files':>8} {'Size':>12}")
     lines.append("-" * 60)
-    for region in ["ภาคกลาง", "ภาคตะวันออก", "ภาคอีสาน", "ภาคเหนือ", "ภาคตะวันตก", "ภาคใต้"]:
+    for region in REGION_NAMES:
         rd = report.regions.get(region, {"provinces": 0, "files": 0, "human": "0 B"})
         lines.append(f"  {region:<20} {rd['provinces']:>9} {rd['files']:>8,} {rd['human']:>12}")
 
@@ -436,20 +344,8 @@ def format_terminal_report(report: SurveyReport) -> str:
 
 
 # ---------------------------------------------------------------------------
-# File outputs
+# Size file outputs
 # ---------------------------------------------------------------------------
-
-def _atomic_write_text(path: Path, text: str) -> None:
-    """Write text atomically via tmp file + os.replace."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.stem + "_tmp" + path.suffix)
-    try:
-        tmp.write_text(text, encoding="utf-8")
-        os.replace(str(tmp), str(path))
-    except Exception:
-        tmp.unlink(missing_ok=True)
-        raise
-
 
 def write_csv_report(provinces: list[ProvinceSize], path: Path) -> None:
     """Write per-province CSV report with atomic write."""
@@ -491,56 +387,101 @@ def write_json_report(report: SurveyReport, path: Path) -> None:
         "provinces": [asdict(p) for p in report.provinces],
     }
     text = json.dumps(data, ensure_ascii=False, indent=2)
-    _atomic_write_text(path, text)
+    atomic_write_text(path, text)
 
 
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
+# ===================================================================
+# Files command helpers
+# ===================================================================
 
-def main(argv: list[str] | None = None) -> int:
-    ap = argparse.ArgumentParser(
-        description="Survey Google Drive folder sizes for all provinces via rclone.",
-    )
-    ap.add_argument(
-        "--workers", type=int, default=10,
-        help="Number of parallel rclone workers. Default: 10",
-    )
-    ap.add_argument(
-        "--output-dir", default="data",
-        help="Output directory for CSV/JSON reports. Default: data/",
-    )
-    ap.add_argument(
-        "--csv", action="store_true",
-        help="Write per-province CSV report.",
-    )
-    ap.add_argument(
-        "--json", action="store_true",
-        help="Write full JSON report.",
-    )
-    ap.add_argument(
-        "--timeout", type=int, default=120,
-        help="Timeout per rclone call in seconds. Default: 120",
-    )
-    ap.add_argument(
-        "--remote", default="gdrive:",
-        help="rclone remote name for Google Drive. Default: gdrive:",
-    )
-    ap.add_argument(
-        "--province-links", default="configs/province_links.csv",
-        help="Path to province_links.csv. Default: configs/province_links.csv",
-    )
-    ap.add_argument(
-        "--cand-csv", default="data/cand_clean.csv",
-        help="Path to cand_clean.csv. Default: data/cand_clean.csv",
-    )
-    args = ap.parse_args(argv)
+def rclone_list_files(
+    province: str, folder_id: str, timeout: int, remote: str,
+) -> tuple[str, list[dict], str]:
+    """List all files recursively. Returns (province, file_list, error)."""
+    if not folder_id:
+        return province, [], "no_link"
+    try:
+        result = subprocess.run(
+            [
+                "rclone", "lsjson", "-R", "-M", "--files-only",
+                remote, "--drive-root-folder-id", folder_id,
+            ],
+            capture_output=True, text=True, timeout=timeout,
+        )
+    except FileNotFoundError:
+        return province, [], "rclone not found"
+    except subprocess.TimeoutExpired:
+        return province, [], f"timeout after {timeout}s"
 
+    if result.returncode != 0:
+        return province, [], result.stderr.strip()[:200]
+
+    try:
+        items = json.loads(result.stdout)
+    except json.JSONDecodeError as e:
+        return province, [], f"bad JSON: {e}"
+
+    return province, items, ""
+
+
+# ===================================================================
+# Owners command helpers
+# ===================================================================
+
+def rclone_folder_owner(
+    folder_id: str,
+    remote: str = "gdrive:",
+    timeout: int = 60,
+) -> tuple[str, str]:
+    """Return (owner_email, error) for a Google Drive folder."""
+    if not folder_id:
+        return "", "no_link"
+    for flag in ["--dirs-only", "--files-only"]:
+        try:
+            result = subprocess.run(
+                [
+                    "rclone", "lsjson", "-M", "--max-depth", "1", flag,
+                    remote, "--drive-root-folder-id", folder_id,
+                ],
+                capture_output=True, text=True, timeout=timeout,
+            )
+            if result.returncode == 0:
+                items = json.loads(result.stdout)
+                if items:
+                    owner = items[0].get("Metadata", {}).get("owner", "unknown")
+                    return owner, ""
+        except FileNotFoundError:
+            return "", "rclone not found"
+        except subprocess.TimeoutExpired:
+            return "", f"timeout after {timeout}s"
+        except Exception as e:
+            return "", str(e)[:100]
+    return "", "empty_folder"
+
+
+def classify_email(email: str) -> str:
+    """Classify an email into account type."""
+    if not email:
+        return "error"
+    if email.endswith("@ect.go.th"):
+        return "official_ect"
+    if "ect" in email.lower():
+        return "ect_gmail"
+    if email.endswith(("@gmail.com", "@hotmail.com", "@yahoo.com")):
+        return "personal"
+    return "institutional"
+
+
+# ===================================================================
+# Subcommand: size
+# ===================================================================
+
+def cmd_size(args: argparse.Namespace) -> int:
+    """Run folder-size survey."""
     links_path = Path(args.province_links)
     cand_path = Path(args.cand_csv)
     output_dir = Path(args.output_dir)
 
-    # --- Parse inputs ---
     if not links_path.exists():
         print(f"Error: province links not found: {links_path}", file=sys.stderr)
         return 1
@@ -590,18 +531,16 @@ def main(argv: list[str] | None = None) -> int:
     print(f"Scanning {len(to_scan)} folders with {args.workers} workers...",
           file=sys.stderr)
 
-    tqdm_cls = _get_tqdm()
+    tqdm_cls = get_tqdm()
     pbar = tqdm_cls(total=len(to_scan), desc="rclone size", unit="prov") if tqdm_cls else None
     processed = 0
     last_fb = 0.0
 
     # Deduplicate: only scan each folder_id once
     unique_ids: dict[str, ProvinceSize] = {}
-    dup_mapping: dict[str, str] = {}  # folder_id -> first province name
     for ps in to_scan:
         if ps.folder_id not in unique_ids:
             unique_ids[ps.folder_id] = ps
-            dup_mapping[ps.folder_id] = ps.province
     scan_targets = list(unique_ids.values())
     dup_targets = [ps for ps in to_scan if ps.folder_id in unique_ids and
                    unique_ids[ps.folder_id] is not ps]
@@ -631,7 +570,7 @@ def main(argv: list[str] | None = None) -> int:
             else:
                 now = time.time()
                 if processed == len(scan_targets) or (now - last_fb) >= 0.25:
-                    print("\r" + _fallback_progress(processed, len(scan_targets)),
+                    print("\r" + fallback_progress(processed, len(scan_targets)),
                           end="", flush=True, file=sys.stderr)
                     last_fb = now
 
@@ -639,7 +578,7 @@ def main(argv: list[str] | None = None) -> int:
         pbar.close()
     else:
         if scan_targets:
-            print(file=sys.stderr)  # newline after progress bar
+            print(file=sys.stderr)
 
     # Copy results to duplicate-mapped provinces
     for ps in dup_targets:
@@ -647,10 +586,6 @@ def main(argv: list[str] | None = None) -> int:
         ps.file_count = source.file_count
         ps.total_bytes = source.total_bytes
         ps.error = source.error
-
-    # Also update the progress bar count for skipped dups
-    if pbar and dup_targets:
-        pass  # already closed
 
     # --- Anomaly detection ---
     anomalies = detect_anomalies(provinces)
@@ -681,6 +616,441 @@ def main(argv: list[str] | None = None) -> int:
             print(f"  ... and {len(failures) - 20} more", file=sys.stderr)
 
     return 1 if failures else 0
+
+
+# ===================================================================
+# Subcommand: files
+# ===================================================================
+
+def cmd_files(args: argparse.Namespace) -> int:
+    """Run full file listing for all provinces."""
+    links_path = Path(args.province_links)
+    output_dir = Path(args.output_dir)
+
+    if not links_path.exists():
+        print(f"Error: {links_path} not found", file=sys.stderr)
+        return 1
+
+    rows = parse_province_links(links_path)
+    if not rows:
+        print("Error: no provinces in CSV", file=sys.stderr)
+        return 1
+
+    # Deduplicate by folder_id
+    unique: dict[str, dict] = {}
+    dup_map: dict[str, list[str]] = {}  # folder_id -> list of provinces
+    for r in rows:
+        fid = r["folder_id"]
+        if not fid:
+            unique[r["province"]] = r
+        elif fid not in dup_map:
+            dup_map[fid] = [r["province"]]
+            unique[r["province"]] = r
+        else:
+            dup_map[fid].append(r["province"])
+
+    scan_list = list(unique.values())
+    print(f"Scanning {len(scan_list)} folders ({len(rows)} provinces) "
+          f"with {args.workers} workers, timeout {args.timeout}s ...",
+          file=sys.stderr)
+
+    # --- Parallel scan ---
+    tqdm_cls = get_tqdm()
+    pbar = (tqdm_cls(total=len(scan_list), desc="listing", unit="prov")
+            if tqdm_cls else None)
+    processed = 0
+    last_fb = 0.0
+
+    results: dict[str, tuple[list[dict], str]] = {}
+    failures: list[tuple[str, str]] = []
+
+    with ThreadPoolExecutor(max_workers=args.workers) as ex:
+        futs = {
+            ex.submit(
+                rclone_list_files,
+                r["province"], r["folder_id"], args.timeout, args.remote,
+            ): r
+            for r in scan_list
+        }
+        for fut in as_completed(futs):
+            province, files, error = fut.result()
+            results[province] = (files, error)
+            if error:
+                failures.append((province, error))
+
+            processed += 1
+            if pbar:
+                pbar.update(1)
+            else:
+                now = time.time()
+                if processed == len(scan_list) or (now - last_fb) >= 0.25:
+                    print("\r" + fallback_progress(processed, len(scan_list)),
+                          end="", flush=True, file=sys.stderr)
+                    last_fb = now
+
+    if pbar:
+        pbar.close()
+    else:
+        if scan_list:
+            print(file=sys.stderr)
+
+    # --- Write master CSV ---
+    csv_path = output_dir / "gdrive_files.csv"
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_csv = csv_path.with_name(csv_path.stem + "_tmp" + csv_path.suffix)
+
+    fieldnames = [
+        "province", "region", "owner", "path", "name",
+        "size_bytes", "size_human", "mime_type", "modified", "created",
+        "file_id", "folder_id",
+    ]
+
+    total_files = 0
+    total_bytes = 0
+    owner_set: set[str] = set()
+    province_stats: list[dict] = []
+
+    try:
+        with open(tmp_csv, "w", encoding="utf-8", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+
+            for r in rows:
+                province = r["province"]
+                fid = r["folder_id"]
+                region = PROVINCE_TO_REGION.get(province, "")
+
+                # Get results — may come from deduplicated scan
+                if province in results:
+                    files, error = results[province]
+                else:
+                    # Shared folder — copy from first province
+                    source = next(
+                        (p for p, rr in results.items()
+                         if any(row["folder_id"] == fid and row["province"] == p
+                                for row in scan_list)),
+                        None,
+                    )
+                    if source:
+                        files, error = results[source]
+                    else:
+                        files, error = [], "shared_folder_not_found"
+
+                prov_files = 0
+                prov_bytes = 0
+
+                for item in files:
+                    meta = item.get("Metadata", {})
+                    size = item.get("Size", 0)
+                    owner = meta.get("owner", "")
+                    owner_set.add(owner)
+
+                    writer.writerow({
+                        "province": province,
+                        "region": region,
+                        "owner": owner,
+                        "path": item.get("Path", ""),
+                        "name": item.get("Name", ""),
+                        "size_bytes": size,
+                        "size_human": human_bytes(size),
+                        "mime_type": meta.get("content-type", item.get("MimeType", "")),
+                        "modified": meta.get("mtime", item.get("ModTime", "")),
+                        "created": meta.get("btime", ""),
+                        "file_id": item.get("ID", ""),
+                        "folder_id": fid,
+                    })
+                    prov_files += 1
+                    prov_bytes += size
+
+                total_files += prov_files
+                total_bytes += prov_bytes
+                province_stats.append({
+                    "province": province,
+                    "region": region,
+                    "folder_id": fid,
+                    "owner": files[0].get("Metadata", {}).get("owner", "") if files else "",
+                    "file_count": prov_files,
+                    "total_bytes": prov_bytes,
+                    "total_human": human_bytes(prov_bytes),
+                    "error": error,
+                })
+
+        os.replace(str(tmp_csv), str(csv_path))
+    except Exception:
+        tmp_csv.unlink(missing_ok=True)
+        raise
+
+    # --- Write summary JSON ---
+    json_path = output_dir / "gdrive_files_summary.json"
+    summary = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "total_provinces": len(rows),
+        "scanned": len(scan_list) - len(failures),
+        "errors": len(failures),
+        "total_files": total_files,
+        "total_bytes": total_bytes,
+        "total_human": human_bytes(total_bytes),
+        "unique_owners": sorted(owner_set - {""}),
+        "provinces": province_stats,
+        "failures": [{"province": p, "error": e} for p, e in failures],
+    }
+    tmp_json = json_path.with_name(json_path.stem + "_tmp" + json_path.suffix)
+    try:
+        tmp_json.write_text(
+            json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(str(tmp_json), str(json_path))
+    except Exception:
+        tmp_json.unlink(missing_ok=True)
+        raise
+
+    # --- Terminal report ---
+    print(f"\n{'='*70}")
+    print(f"  Full File Listing Report")
+    print(f"  {summary['timestamp']}")
+    print(f"{'='*70}")
+    print(f"\n  Total: {total_files:,} files, {human_bytes(total_bytes)}")
+    print(f"  Scanned: {summary['scanned']}/{len(rows)} provinces")
+    print(f"  Unique owners: {len(summary['unique_owners'])}")
+    print(f"\n{'-'*70}")
+    print(f"  {'Province':<25} {'Owner':<35} {'Files':>7} {'Size':>10}")
+    print(f"{'-'*70}")
+    for ps in sorted(province_stats, key=lambda x: x["total_bytes"], reverse=True):
+        owner = ps["owner"][:33] if ps["owner"] else ps["error"][:33] if ps["error"] else ""
+        print(f"  {ps['province']:<25} {owner:<35} {ps['file_count']:>7,} {ps['total_human']:>10}")
+
+    print(f"\n  CSV: {csv_path}")
+    print(f"  JSON: {json_path}")
+    print(f"{'='*70}")
+
+    if failures:
+        print(f"\n{len(failures)} error(s):", file=sys.stderr)
+        for p, e in failures:
+            print(f"  - {p}: {e}", file=sys.stderr)
+
+    return 1 if failures else 0
+
+
+# ===================================================================
+# Subcommand: owners
+# ===================================================================
+
+def cmd_owners(args: argparse.Namespace) -> int:
+    """Run folder ownership forensics."""
+    links_path = Path(args.province_links)
+    output_dir = Path(args.output_dir)
+
+    if not links_path.exists():
+        print(f"Error: {links_path} not found", file=sys.stderr)
+        return 1
+
+    rows = parse_province_links(links_path)
+    if not rows:
+        print("Error: no provinces in CSV", file=sys.stderr)
+        return 1
+
+    # Deduplicate by folder_id
+    seen_ids: dict[str, dict] = {}
+    scan_tasks: list[dict] = []
+    for r in rows:
+        fid = r["folder_id"]
+        if not fid:
+            scan_tasks.append(r)
+        elif fid not in seen_ids:
+            seen_ids[fid] = r
+            scan_tasks.append(r)
+
+    print(f"Scanning {len(scan_tasks)} folders with {args.workers} workers...",
+          file=sys.stderr)
+
+    # --- Parallel scan ---
+    tqdm_cls = get_tqdm()
+    pbar = (tqdm_cls(total=len(scan_tasks), desc="owners", unit="prov")
+            if tqdm_cls else None)
+    processed = 0
+
+    results: dict[str, tuple[str, str]] = {}  # key -> (owner, error)
+
+    with ThreadPoolExecutor(max_workers=args.workers) as ex:
+        futs = {
+            ex.submit(
+                rclone_folder_owner, r["folder_id"], args.remote, args.timeout,
+            ): r
+            for r in scan_tasks
+        }
+        for fut in as_completed(futs):
+            r = futs[fut]
+            owner, err = fut.result()
+            key = r["folder_id"] or r["province"]
+            results[key] = (owner, err)
+
+            processed += 1
+            if pbar:
+                pbar.update(1)
+            else:
+                print("\r" + fallback_progress(processed, len(scan_tasks)),
+                      end="", flush=True, file=sys.stderr)
+
+    if pbar:
+        pbar.close()
+    elif scan_tasks:
+        print(file=sys.stderr)
+
+    # --- Build full report ---
+    report: list[dict] = []
+    for r in rows:
+        fid = r["folder_id"]
+        key = fid if fid and fid in results else r["province"]
+        owner, err = results.get(key, ("", "not_scanned"))
+        report.append({**r, "owner": owner, "error": err})
+
+    # --- Terminal report ---
+    sep = "=" * 75
+    dash = "-" * 75
+
+    print(f"\n{sep}")
+    print("  FOLDER OWNERSHIP FORENSICS REPORT")
+    print(f"  {links_path} — {len(report)} provinces")
+    print(sep)
+
+    # Type breakdown
+    type_counts: dict[str, int] = {}
+    for r in report:
+        t = classify_email(r["owner"])
+        type_counts[t] = type_counts.get(t, 0) + 1
+
+    print("\n  Account type breakdown:")
+    for t, c in sorted(type_counts.items(), key=lambda x: -x[1]):
+        print(f"    {t:<20} {c:>3}")
+
+    # Anomalies
+    print(f"\n{dash}")
+    print("  ANOMALIES")
+    print(dash)
+
+    # Shared folders
+    fid_provs: dict[str, list[str]] = {}
+    for r in report:
+        if r["folder_id"]:
+            fid_provs.setdefault(r["folder_id"], []).append(r["province"])
+    for fid, provs in fid_provs.items():
+        if len(provs) > 1:
+            print(f"  [SHARED_FOLDER] {' + '.join(provs)}")
+            print(f"                  folder_id: {fid}")
+
+    for r in report:
+        t = classify_email(r["owner"])
+        if t == "personal":
+            print(f"  [PERSONAL]      {r['province']}: {r['owner']}")
+        elif t == "official_ect":
+            print(f"  [OFFICIAL_GOV]  {r['province']}: {r['owner']}")
+        elif t == "institutional":
+            print(f"  [INSTITUTIONAL] {r['province']}: {r['owner']}")
+
+    for r in report:
+        if r["error"]:
+            print(f"  [ERROR]         {r['province']}: {r['error']}")
+
+    # Full table
+    print(f"\n{dash}")
+    print(f"  {'#':<3} {'Province':<25} {'Owner':<40} {'Type'}")
+    print(dash)
+    for i, r in enumerate(report, 1):
+        etype = classify_email(r["owner"])
+        owner = r["owner"][:38] if r["owner"] else f"[{r['error']}]"
+        flag = " *" if etype == "personal" else ""
+        print(f"  {i:<3} {r['province']:<25} {owner:<40} {etype}{flag}")
+    print(sep)
+
+    # --- CSV output ---
+    csv_path = output_dir / "folder_owners.csv"
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(csv_path, "w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=[
+            "province", "folder_owner", "email_type",
+            "folder_id", "folder_url", "error",
+        ])
+        writer.writeheader()
+        for r in report:
+            writer.writerow({
+                "province": r["province"],
+                "folder_owner": r["owner"],
+                "email_type": classify_email(r["owner"]),
+                "folder_id": r["folder_id"],
+                "folder_url": r["folder_url"],
+                "error": r["error"],
+            })
+    print(f"\n  CSV saved: {csv_path}")
+
+    return 0
+
+
+# ===================================================================
+# CLI: argparse with subparsers
+# ===================================================================
+
+def main(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(
+        description="Survey Google Drive province folders via rclone.",
+    )
+
+    # Shared arguments on parent parser
+    ap.add_argument(
+        "--workers", type=int, default=10,
+        help="Number of parallel rclone workers (default: 10)",
+    )
+    ap.add_argument(
+        "--timeout", type=int, default=120,
+        help="Timeout per rclone call in seconds (default varies by subcommand)",
+    )
+    ap.add_argument(
+        "--remote", default="gdrive:",
+        help="rclone remote name (default: gdrive:)",
+    )
+    ap.add_argument(
+        "--province-links", default="configs/province_links.csv",
+        help="Path to province_links.csv (default: configs/province_links.csv)",
+    )
+    ap.add_argument(
+        "--output-dir", default="data",
+        help="Output directory (default: data/)",
+    )
+
+    sub = ap.add_subparsers(dest="command", required=True)
+
+    # --- size ---
+    sp_size = sub.add_parser("size", help="Measure folder sizes (rclone size --json)")
+    sp_size.add_argument("--csv", action="store_true", help="Write per-province CSV report")
+    sp_size.add_argument("--json", action="store_true", help="Write full JSON report")
+    sp_size.add_argument(
+        "--cand-csv", default="data/cand_clean.csv",
+        help="Path to cand_clean.csv (default: data/cand_clean.csv)",
+    )
+
+    # --- files ---
+    sp_files = sub.add_parser("files", help="List every file (rclone lsjson -R)")
+
+    # --- owners ---
+    sp_owners = sub.add_parser("owners", help="Identify folder owners (rclone lsjson -M)")
+
+    args = ap.parse_args(argv)
+
+    # Apply per-subcommand defaults when the user hasn't explicitly set them
+    if args.command == "files":
+        # Re-parse to check if user explicitly passed --timeout / --workers
+        if "--timeout" not in (argv or sys.argv[1:]):
+            args.timeout = 600
+        if "--workers" not in (argv or sys.argv[1:]):
+            args.workers = 5
+    elif args.command == "owners":
+        if "--timeout" not in (argv or sys.argv[1:]):
+            args.timeout = 60
+
+    dispatch = {
+        "size": cmd_size,
+        "files": cmd_files,
+        "owners": cmd_owners,
+    }
+    return dispatch[args.command](args)
 
 
 if __name__ == "__main__":

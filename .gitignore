@@ -32,3 +32,6 @@ service-account*.json
 !data/ballotlist_official.xlsx
 !data/cand_clean.csv
 !data/หน่วยเลือกตั้้ง210169.pdf
+!data/survey_gdrive.csv
+!data/folder_owners.csv
+!data/gdrive_files_summary.md
