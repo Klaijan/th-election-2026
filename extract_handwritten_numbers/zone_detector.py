@@ -69,8 +69,26 @@ class ZoneDetector:
                 )
                 t_region_templates += float(time.perf_counter() - t0)
                 n_region_pages += 1
-                # IMPORTANT: if anchors are not found, do NOT fall back to a broad band.
-                # Caller should skip dotted-line detection when fields=(0,0).
+                # Fallback: if region templates fail, try zone-1 templates (template_4/template_5).
+                # Still do NOT fall back to a broad band; if both fail, keep fields=(0,0).
+                if fields == (0, 0):
+                    y_end2 = int(round(float(h) * float(getattr(config, "ZONE1_TEMPLATE_SEARCH_Y_FRAC", 0.65))))
+                    y_end2 = max(1, min(y_end2, h))
+                    x_end2 = int(round(float(w) * float(getattr(config, "ZONE1_TEMPLATE_SEARCH_X_FRAC", 0.5))))
+                    x_end2 = max(1, min(x_end2, w))
+                    fields2, hits2 = self._infer_fields_zone_from_zone1_templates(
+                        page, search_zone=(0, int(y_end2)), search_x_end=int(x_end2)
+                    )
+                    if fields2 != (0, 0):
+                        fields = fields2
+                        zone1_hits = hits2
+                        region_status = {
+                            **(region_status or {}),
+                            "status": "fallback_zone1_templates",
+                        }
+                        # Update search window metadata to match the fallback method.
+                        y_end = int(y_end2)
+                        x_end = int(x_end2)
             else:
                 # Continuation pages: treat as table-only (full page).
                 header = (0, 0)
@@ -206,6 +224,23 @@ class ZoneDetector:
                 )
                 region_time_total += float(time.perf_counter() - t0)
                 n_region_pages += 1
+                # Fallback: if region templates fail, try zone-1 templates (template_4/template_5).
+                # This helps when region anchors are missing on some first pages, while still avoiding
+                # overly broad dot detection that can create false positives.
+                if fields == (0, 0):
+                    y_end2 = int(round(float(h) * float(getattr(config, "ZONE1_TEMPLATE_SEARCH_Y_FRAC", 0.65))))
+                    y_end2 = max(1, min(y_end2, h))
+                    x_end2 = int(round(float(w) * float(getattr(config, "ZONE1_TEMPLATE_SEARCH_X_FRAC", 0.5))))
+                    x_end2 = max(1, min(x_end2, w))
+                    fields2, hits2 = self._infer_fields_zone_from_zone1_templates(
+                        page, search_zone=(0, int(y_end2)), search_x_end=int(x_end2)
+                    )
+                    if fields2 != (0, 0):
+                        fields = fields2
+                        zone1_hits = hits2
+                        region_status = {**(region_status or {}), "status": "fallback_zone1_templates"}
+                        y_end = int(y_end2)
+                        x_end = int(x_end2)
             else:
                 header = (0, 0)
                 fields = (0, 0)
