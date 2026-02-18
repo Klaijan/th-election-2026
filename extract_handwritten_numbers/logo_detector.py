@@ -38,7 +38,34 @@ class LogoDetector:
     ) -> None:
         templates_dir = Path(__file__).resolve().parent / "templates"
         default_template = templates_dir / str(getattr(config, "LOGO_TEMPLATE_FILE", "logo.png"))
-        self.template_path = Path(template_path) if template_path is not None else default_template
+
+        def _rewrite_legacy_template_path(p: Path) -> Path:
+            """
+            Backwards-compat: older revisions used templates under:
+              scripts/extract_handwritten_numbers/templates/
+            The library now lives at:
+              extract_handwritten_numbers/templates/
+
+            If a caller/environment still passes the legacy path, rewrite it so the
+            logo detector keeps working after the refactor.
+            """
+            parts = p.parts
+            # If the path ends with .../scripts/extract_handwritten_numbers/templates/<file>
+            if len(parts) >= 4 and parts[-4:-1] == ("scripts", "extract_handwritten_numbers", "templates"):
+                return templates_dir / parts[-1]
+
+            # Otherwise, map the first occurrence of scripts/extract_handwritten_numbers/templates/<file>
+            # to this package's templates directory.
+            for i in range(len(parts) - 3):
+                if parts[i : i + 3] == ("scripts", "extract_handwritten_numbers", "templates") and (i + 3) < len(parts):
+                    return templates_dir / parts[i + 3]
+
+            return p
+
+        if template_path is not None:
+            self.template_path = _rewrite_legacy_template_path(Path(template_path))
+        else:
+            self.template_path = _rewrite_legacy_template_path(default_template)
         self.threshold = float(threshold if threshold is not None else getattr(config, "LOGO_DETECTION_THRESHOLD", 0.70))
         self.search_y_frac = float(search_y_frac if search_y_frac is not None else getattr(config, "LOGO_SEARCH_Y_FRAC", 0.20))
         if scales is not None:
