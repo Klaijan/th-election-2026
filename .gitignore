@@ -25,6 +25,7 @@ __pycache__/
 .env
 .env.*
 env.local
+service-account*.json
 
 !data/ballotlist.csv
 !data/ballotlist_official.xlsx
