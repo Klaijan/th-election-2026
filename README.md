@@ -1,27 +1,40 @@
 ## Vote69 — Mirror ECT drives and OCR Pipeline
 
-This repo currently does four things:
+Extract structured data from Thai election form PDFs (สส.5/18, สส.5/11) published by the Election Commission of Thailand (กกต.) and make it available as open data.
 
-1. Locally download official ECT google drive for selected provinces (via `.configs/province.txt`)
-2. Crop election-form PDFs into a consistent band / region (PyMuPDF)
-3. OCR cropped outputs via **Typhoon OCR** (remote API)
-4. Multi-page Thai form pipeline to extract handwritten numbers on/above dotted lines and **table column 3 only** (Google Cloud Vision)
+### Which path should I use?
 
-### Quick flow (end-to-end)
+| Path | Script | Output | When to use |
+|------|--------|--------|-------------|
+| A — Mirror | `sync_selected_from_csv.sh` | PDF files | Download ECT Google Drive locally |
+| B — Crop | `crop_pdf_page.py` | Cropped PDFs | Normalize PDF bands before OCR |
+| C — Typhoon OCR | `run_typhoon_ocr.py` | Markdown + JSONL | Fast line-level OCR (remote API) |
+| D — CV Pipeline | `main.py` | result.json | Precise cropped-region OCR (Google Vision) |
+| E — Vision LLM | `run_gemini_extract.py` | Structured JSON | Full-form extraction (Gemini / Ollama) |
 
-- **Crop PDFs (optional)**: `crop_pdf_page.py` / `batch_crop_pdfs.py` → smaller PDFs with consistent regions.
-- **OCR path #1 (Typhoon)**: `run_typhoon_ocr.py` → Markdown per file + JSONL manifest (resume/skip) → `extract_typhoon_counts.py` pulls `จำนวน <n> คน/บัตร`.
-- **OCR path #2 (Thai multi-page forms)**: `main.py` → `extract_handwritten_numbers/`
-  - PDF → images (default 400 DPI)
-  - **Template/zone detection** (page 1 band via `template_4.png` + `template_5.png`; optional logo split + region anchors)
-  - Detect dotted lines (fields) + detect table grid (continuation pages) → crop **fields + last table column**
-  - **One batch OCR** (Google Vision; Tesseract fallback) → validate + write `output/**/result.json` (+ `debug_output/`)
+**Recommended for production**: Path **E** (Vision LLM) extracts the complete form as structured JSON in one shot — constituency, candidates, vote counts, voter stats — without the multi-step CV pipeline.
 
-### Status / not done yet (WIP)
+### Architecture
 
-- **Template detector tuning**: zone/template matching thresholds + robustness across scan variants is still in progress (`extract_handwritten_numbers/zone_detector.py`, templates under `extract_handwritten_numbers/templates/`).
-- **OCR review/tuning**: OCR is wired (`extract_handwritten_numbers/ocr_processor.py`) but accuracy, failure modes, and post-processing rules still need a real review on your target scans.
-- **Two OCR files**: Typhoon OCR entrypoint is `run_typhoon_ocr.py` (repo root), and the multi-page pipeline OCR module is `extract_handwritten_numbers/ocr_processor.py` (inside the package).
+```
+scripts/
+  run_typhoon_ocr.py ─── Typhoon remote API ──> Markdown + JSONL
+  run_gemini_extract.py ─ Vision LLM (Gemini/Ollama) ──> Structured JSON
+  crop_pdf_page.py ───── PDF cropping
+  survey_folders.py ──── Data folder recon
+
+extract_handwritten_numbers/     (CV Pipeline package)
+  main.py ─── Orchestrator
+  pdf_loader.py ─── PDF -> images (400 DPI)
+  zone_detector.py ─── Template matching (logo, region anchors)
+  dot_detector.py ─── Dotted-line detection (fields)
+  table_detector.py ─── Grid detection (tables)
+  field_extractor.py ─── Crop field regions
+  table_extractor.py ─── Crop table columns
+  ocr_processor.py ─── Google Vision / Tesseract OCR
+  validator.py ─── Cross-field validation
+  config.py ─── Configuration
+```
 
 ### Setup
 
@@ -127,7 +140,6 @@ Notes:
 - Manifest is append-only JSONL (source of truth for resuming).
 - `run_typhoon_ocr.py` will automatically load `env.local` by default (see `--env-file`).
 - Progress bar is enabled by default; disable with `--no-progress`.
-- At the end of each run, the script appends a `row_type=run_summary` record into a separate stats JSONL file (default: `*.stats.jsonl` next to your manifest).
 - Preflight without API calls:
 
 ```bash
@@ -138,16 +150,9 @@ python scripts/run_typhoon_ocr.py \
   --dry-run
 ```
 
-### C) Extract the numbers you care about (post-processing)
+#### Extract counts (post-processing)
 
-This scans Typhoon OCR Markdown and extracts every occurrence of:
-
-- `จำนวน <n> คน`
-- `จำนวน <n> บัตร`
-
-It keeps the **order** (so you can rely on position) and also captures an optional **schema** prefix (e.g. `2.2.1`) + the **label text** before the number (for foolproofing).
-
-Example (partylist):
+Scans Typhoon OCR Markdown and extracts `จำนวน <n> คน/บัตร` occurrences:
 
 ```bash
 python scripts/extract_typhoon_counts.py \
@@ -156,16 +161,16 @@ python scripts/extract_typhoon_counts.py \
   --kind partylist
 ```
 
-### D) Multi-page Thai form OCR (Google Cloud Vision) — dotted lines + table column 3 only
+### D) CV Pipeline — Multi-page Thai form OCR (Google Cloud Vision)
 
-This is the **production-style pipeline** described in the prompt (`extract_handwritten_numbers/` package). It:
+The `extract_handwritten_numbers/` package. It:
 
 - Converts a multi-page PDF to images (default **400 DPI**)
 - Detects dotted lines in the fields zone (page 1)
-- Detects zone-1 y-range on page 1 using `template_4.png` (top anchor) and `template_5.png` (bottom anchor), then searches for dotted lines inside that band.
+- Detects zone-1 y-range on page 1 using `template_4.png` (top anchor) and `template_5.png` (bottom anchor), then searches for dotted lines inside that band
 - Detects table grids and extracts **only the last column** across continuation pages
 - Batches all crops into **one** OCR call (Google Cloud Vision)
-- Validates outputs and produces a review queue
+- Validates outputs (cross-field checks: valid + invalid + no_vote = ballots_used)
 
 #### System dependencies
 
@@ -184,13 +189,92 @@ Set `GOOGLE_APPLICATION_CREDENTIALS=/path/to/service-account.json` in your envir
 python main.py --input data/sample/district --out output --debug
 ```
 
+Override OCR provider (default: google):
+
+```bash
+python main.py --input data/sample/district --out output --ocr-provider tesseract
+```
+
 Outputs:
 
 - `output/result.json`
 - `output/debug_output/` (zones, dotted-line overlays, sample crops, OCR+timing JSON)
 
-#### Tests
+### E) Vision LLM — Gemini / Ollama structured extraction
+
+Unlike OCR-only paths (C, D) which read cropped regions, this path sends a **whole page image** to a Vision LLM and extracts the complete form as structured JSON in one shot.
+
+Extraction output per page:
+
+```json
+{
+  "form_type": "สส.5/18 แบ่งเขต",
+  "province": "ลำปาง",
+  "constituency": 4,
+  "amphoe": "แม่พริก",
+  "tambon": "แม่พริก",
+  "unit_number": 1,
+  "voter_stats": {
+    "eligible_voters": 445,
+    "ballots_used": 300,
+    "valid_ballots": 290,
+    "invalid_ballots": 8,
+    "no_vote_ballots": 2
+  },
+  "candidates": [
+    {"number": 1, "name": "...", "party": "...", "votes": 120},
+    {"number": 2, "name": "...", "party": "...", "votes": 170}
+  ]
+}
+```
+
+#### Backend options
+
+| Backend | Flag | Default model | Use case |
+|---------|------|---------------|----------|
+| Gemini (Google API) | `--backend gemini` | `gemini-2.0-flash` | Cloud; requires `GEMINI_API_KEY` in `env.local` |
+| Ollama (local) | `--backend ollama` | `qwen3-vl:8b` | Air-gapped; no API key needed |
+
+#### Gemini (cloud)
+
+```bash
+python scripts/run_gemini_extract.py \
+  --input "data/raw/ลำปาง/เขตเลือกตั้งที่ 4" \
+  --out-root data/gemini_output \
+  --manifest-jsonl data/gemini_output/manifest.jsonl \
+  --backend gemini \
+  --model gemini-2.0-flash \
+  --workers 5
+```
+
+#### Ollama (local vision model)
+
+```bash
+ollama pull qwen3-vl:8b
+python scripts/run_gemini_extract.py \
+  --input data/sample/district \
+  --out-root data/ollama_output \
+  --manifest-jsonl data/ollama_output/manifest.jsonl \
+  --backend ollama \
+  --model qwen3-vl:8b \
+  --workers 1
+```
+
+Notes:
+
+- Only **odd pages** are processed (page 1, 3, 5... = vote tables; even pages = signatures)
+- Resume/skip is automatic via manifest JSONL
+- Rate limiting is built-in for Gemini API
+- Dry-run mode: add `--dry-run`
+
+### Tests
 
 ```bash
 pytest -q
 ```
+
+### Status / WIP
+
+- **Template detector tuning**: zone/template matching thresholds + robustness across scan variants is still in progress.
+- **OCR review/tuning**: OCR accuracy and post-processing rules need review on target scans.
+- **Gemini extraction validation**: compare structured JSON output against manual counts for accuracy measurement.
