@@ -42,9 +42,16 @@ class OCRProcessor:
     Fallback: Tesseract via pytesseract (if installed); lower accuracy.
     """
 
-    def __init__(self, *, provider: str = config.OCR_PROVIDER, languages: Optional[List[str]] = None):
+    def __init__(
+        self,
+        *,
+        provider: str = config.OCR_PROVIDER,
+        languages: Optional[List[str]] = None,
+        credentials_path: Optional[str] = None,
+    ):
         self.provider = str(provider or "google").lower().strip()
         self.languages = list(languages or config.OCR_LANGUAGES)
+        self._credentials_path = credentials_path
 
     def batch_ocr(self, images: List[np.ndarray], image_ids: List[str], *, retries: int = 3) -> Dict[str, OCRItem]:
         if len(images) != len(image_ids):
@@ -65,17 +72,26 @@ class OCRProcessor:
         raise ValueError(f"Unknown OCR provider: {self.provider}")
 
     def _batch_google(self, images: List[np.ndarray], image_ids: List[str], *, retries: int) -> Dict[str, OCRItem]:
+        import os
+
         try:
             from google.cloud import vision  # type: ignore
             from google.api_core import exceptions as gexc  # type: ignore
         except ModuleNotFoundError as e:  # pragma: no cover
             raise RuntimeError("google-cloud-vision not installed") from e
 
-        client = vision.ImageAnnotatorClient()
+        # Support explicit service account key file
+        creds_path = self._credentials_path or os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "")
+        if creds_path:
+            from google.oauth2 import service_account  # type: ignore
+
+            credentials = service_account.Credentials.from_service_account_file(creds_path)
+            client = vision.ImageAnnotatorClient(credentials=credentials)
+        else:
+            client = vision.ImageAnnotatorClient()
 
         requests = []
         for img in images:
-            # Encode to JPEG (small + good enough for handwriting)
             ok, buf = cv2.imencode(".jpg", img, [int(cv2.IMWRITE_JPEG_QUALITY), 92])
             if not ok:
                 raise RuntimeError("cv2.imencode(.jpg) failed")
@@ -89,19 +105,25 @@ class OCRProcessor:
         last_err: Optional[Exception] = None
         for attempt in range(int(retries) + 1):
             try:
-                resp = client.batch_annotate_images(requests=requests)
+                resp = client.batch_annotate_images(
+                    requests=requests,
+                    timeout=30.0,
+                )
                 return self._parse_google_response(resp, image_ids)
             except Exception as e:
                 last_err = e
                 retriable = False
-                if "ResourceExhausted" in type(e).__name__:
-                    retriable = True
-                if "DeadlineExceeded" in type(e).__name__:
+                err_name = type(e).__name__
+                if "ResourceExhausted" in err_name or "DeadlineExceeded" in err_name:
                     retriable = True
                 if isinstance(e, getattr(gexc, "ResourceExhausted", ())):
                     retriable = True
                 if isinstance(e, getattr(gexc, "DeadlineExceeded", ())):
                     retriable = True
+                # Expired/revoked credentials are not retriable
+                if "RefreshError" in err_name or "invalid_grant" in str(e):
+                    log.error("Google credentials expired or revoked — not retriable")
+                    break
                 if not retriable or attempt >= int(retries):
                     break
                 sleep_s = (2**attempt) + random.random()

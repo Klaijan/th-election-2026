@@ -26,6 +26,19 @@ class ZoneDetector:
         self._logged_zone1_template_fallback = False
         # Populated after classify_* calls; used by main.py to include step-2 breakdowns in result.json.
         self.last_step2_breakdown: dict = {}
+        # Cache loaded template images to avoid re-reading from disk on every call.
+        self._template_cache: Dict[str, np.ndarray | None] = {}
+
+    def _load_template(self, filename: str) -> np.ndarray | None:
+        """Load a grayscale template image, caching the result."""
+        if filename in self._template_cache:
+            return self._template_cache[filename]
+        templates_dir = Path(__file__).resolve().parent / "templates"
+        t = cv2.imread(str(templates_dir / filename), cv2.IMREAD_GRAYSCALE)
+        if t is not None and t.size == 0:
+            t = None
+        self._template_cache[filename] = t
+        return t
 
     @staticmethod
     def _zone_px(height: int, frac_zone: Tuple[float, float]) -> Tuple[int, int]:
@@ -334,11 +347,10 @@ class ZoneDetector:
 
         gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
 
-        templates_dir = (Path(__file__).resolve().parent / "templates")
         fn4, fn5 = getattr(config, "ZONE1_TEMPLATE_FILES", ("template_4.png", "template_5.png"))
-        t4 = cv2.imread(str(templates_dir / fn4), cv2.IMREAD_GRAYSCALE)
-        t5 = cv2.imread(str(templates_dir / fn5), cv2.IMREAD_GRAYSCALE)
-        if t4 is None or t4.size == 0 or t5 is None or t5.size == 0:
+        t4 = self._load_template(fn4)
+        t5 = self._load_template(fn5)
+        if t4 is None or t5 is None:
             if not self._logged_zone1_template_fallback:
                 log.info(
                     "Zone-1 templates not found/loaded (%s, %s) under %s; falling back to broad above-table zone.",
@@ -415,7 +427,6 @@ class ZoneDetector:
             return (0, 0), [], {"status": "empty_roi"}
 
         gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-        templates_dir = (Path(__file__).resolve().parent / "templates")
 
         thr = float(getattr(config, "REGION_TEMPLATE_THRESHOLD", 0.70))
         # Prefer range sweep to match debug script behavior.
@@ -443,10 +454,7 @@ class ZoneDetector:
         tried: list[dict] = []
 
         def _load_gray(fn: str) -> np.ndarray | None:
-            t = cv2.imread(str(templates_dir / fn), cv2.IMREAD_GRAYSCALE)
-            if t is None or t.size == 0:
-                return None
-            return t
+            return self._load_template(fn)
 
         def _try_pair(pair: tuple[str, str], *, tag: str) -> tuple[Tuple[int, int], list[dict]] | None:
             fn_begin, fn_end = str(pair[0]), str(pair[1])
@@ -662,6 +670,6 @@ class ZoneDetector:
             elif dy >= 140 and dx <= 6:
                 vert += 1
 
-        return (horiz >= 3) and (vert >= 2)
+        return (horiz >= 3) and (vert >= 3)
 
 
