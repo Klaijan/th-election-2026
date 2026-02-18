@@ -20,10 +20,9 @@ if str(_ROOT) not in sys.path:
 
 try:
     # Prefer the repo-local pipeline implementation.
-    from scripts.extract_handwritten_numbers.main import _cli
+    from extract_handwritten_numbers.main import _cli
 except ModuleNotFoundError as e:  # pragma: no cover
     # Common causes:
-    # - A different "scripts" package is installed in the environment and shadows ./scripts
     # - Dependencies like opencv-python (cv2) are not installed
     if getattr(e, "name", "") == "cv2":
         raise SystemExit(
