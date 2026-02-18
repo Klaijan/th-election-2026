@@ -76,10 +76,50 @@ class Validator:
             "auto_accepted": int(auto),
             "review_needed": int(review),
             "manual_entry": int(manual),
-            "accuracy_estimate": "75%",  # placeholder; true accuracy requires labeled evaluation
         }
         structured["review_queue"] = review_queue
         return structured
+
+    @staticmethod
+    def cross_validate_voter_stats(stats: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Check arithmetic consistency of voter statistics.
+
+        Expected: valid_ballots + invalid_ballots + no_vote_ballots == ballots_used
+        Expected: total_candidate_votes <= valid_ballots
+        """
+        warnings: List[Dict[str, Any]] = []
+
+        def _int(key: str) -> int | None:
+            v = stats.get(key)
+            if v is None:
+                return None
+            try:
+                return int(v)
+            except (ValueError, TypeError):
+                return None
+
+        valid = _int("valid_ballots")
+        invalid = _int("invalid_ballots")
+        no_vote = _int("no_vote_ballots")
+        used = _int("ballots_used")
+        total_votes = _int("total_candidate_votes")
+
+        if valid is not None and invalid is not None and no_vote is not None and used is not None:
+            expected = valid + invalid + no_vote
+            if expected != used:
+                warnings.append({
+                    "check": "ballot_sum",
+                    "detail": f"valid({valid}) + invalid({invalid}) + no_vote({no_vote}) = {expected} != ballots_used({used})",
+                })
+
+        if total_votes is not None and valid is not None:
+            if total_votes > valid:
+                warnings.append({
+                    "check": "votes_exceed_valid",
+                    "detail": f"total_candidate_votes({total_votes}) > valid_ballots({valid})",
+                })
+
+        return warnings
 
     def _status(self, confidence: float) -> str:
         if float(confidence) >= float(self.auto_threshold):
