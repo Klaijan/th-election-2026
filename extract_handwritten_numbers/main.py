@@ -109,6 +109,90 @@ def _draw_logo_overlay(page_bgr: np.ndarray, *, bbox: list | tuple, confidence: 
     return out
 
 
+def _draw_region_template_diagnostics_overlay(page_bgr: np.ndarray, meta: Dict[str, Any]) -> np.ndarray:
+    """
+    Visualize region_begin/region_end template matching diagnostics on the page.
+
+    This uses `meta["region_templates"]["tried"][].best[]` so you can see best hits even when
+    they were rejected (below threshold / invalid order).
+    """
+    out = page_bgr.copy()
+    h, w = out.shape[:2]
+
+    # Draw search window (same as zone_detector used)
+    z1 = meta.get("zone1_template_search") or {}
+    x_end = int(z1.get("x_end") or w)
+    y_end = int(z1.get("y_end") or h)
+    x_end = max(1, min(x_end, w))
+    y_end = max(1, min(y_end, h))
+    cv2.rectangle(out, (0, 0), (x_end - 1, y_end - 1), (255, 0, 0), 2)
+
+    rt = meta.get("region_templates") or {}
+    thr = rt.get("threshold", None)
+    method = str(rt.get("method", ""))
+    status = str(rt.get("status", ""))
+    used = rt.get("used_templates") or []
+    cv2.putText(
+        out,
+        f"region_templates: status={status} method={method} thr={thr} used={used}",
+        (10, 40),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.9,
+        (255, 0, 0),
+        2,
+        lineType=cv2.LINE_AA,
+    )
+
+    tried = rt.get("tried") or []
+    y_text = 80
+    for entry in tried:
+        tag = str(entry.get("tag", ""))
+        files = entry.get("files") or ["", ""]
+        accepted = entry.get("accepted") or [False, False]
+        best = entry.get("best") or [None, None]
+        reason = str(entry.get("reason", ""))
+
+        cv2.putText(
+            out,
+            f"{tag} files={files} accepted={accepted} reason={reason}",
+            (10, y_text),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.8,
+            (0, 0, 255) if reason else (0, 180, 0),
+            2,
+            lineType=cv2.LINE_AA,
+        )
+        y_text += 30
+
+        for j in (0, 1):
+            b = best[j] or None
+            if not b:
+                continue
+            try:
+                x, y, bw, bh = b.get("bbox") or (0, 0, 0, 0)
+                x, y, bw, bh = int(x), int(y), int(bw), int(bh)
+                conf = float(b.get("confidence", 0.0))
+                sc = float(b.get("scale", 1.0))
+                tf = str(b.get("template_file", ""))
+            except Exception:
+                continue
+            # bbox is ROI-relative (roi starts at 0,0 on the page)
+            color = (0, 200, 0) if bool(accepted[j]) else (0, 0, 255)
+            cv2.rectangle(out, (x, y), (x + bw, y + bh), color, 3)
+            cv2.putText(
+                out,
+                f"{Path(tf).name} {conf:.3f} s={sc:.2f}",
+                (x, max(20, y - 6)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                color,
+                2,
+                lineType=cv2.LINE_AA,
+            )
+
+    return out
+
+
 def structure_results(
     field_regions: List[ExtractedRegion],
     table_regions: List[ExtractedRegion],
@@ -169,6 +253,7 @@ def process_form(pdf_path: str, output_dir: str = "output", *, debug: bool = Fal
 
     timings: Dict[str, float] = {}
     step2_detail: Dict[str, Any] = {}
+    manual_review: List[Dict[str, Any]] = []
 
     def _write_failure_result(err: str) -> Dict[str, Any]:
         """
@@ -275,6 +360,11 @@ def process_form(pdf_path: str, output_dir: str = "output", *, debug: bool = Fal
                             img, m.get("zone1_template_hits") or [], search_zone, search_x
                         ),
                     )
+                    # Best-hit diagnostics overlay (shows best matches even if rejected)
+                    save_image(
+                        debug_root / f"page_{p:02d}_doc_{did0+1:02d}_page_{doc_local:02d}_region_templates_best_overlay.jpg",
+                        _draw_region_template_diagnostics_overlay(img, m),
+                    )
                     save_image(
                         debug_root / f"page_{p:02d}_zone1_fields_zone.jpg",
                         _draw_zone1_fields_band(img, m["zones"]["fields"]),
@@ -300,6 +390,23 @@ def process_form(pdf_path: str, output_dir: str = "output", *, debug: bool = Fal
                 first_idx = int(first_meta.get("page_num", 0))
 
                 log.info("Processing document %d: pages=%s first_page=%d", int(did), [int(m["page_num"]) + 1 for m in doc_pages], first_idx + 1)
+
+                # Manual review flag: logo page but region templates didn't yield a fields band.
+                rt = first_meta.get("region_templates") or {}
+                if bool(first_meta.get("logo_detected", False)) and str(rt.get("status", "")) != "ok":
+                    msg = (
+                        f"Manual review needed: pdf={pdf_path} doc={int(did)} first_page={first_idx+1} "
+                        f"region_templates_status={rt.get('status')} used={rt.get('used_templates')}"
+                    )
+                    log.warning(msg)
+                    manual_review.append(
+                        {
+                            "document_id": int(did),
+                            "first_page": int(first_idx),
+                            "reason": "region_templates_failed",
+                            "region_templates": rt,
+                        }
+                    )
 
                 # Fields (only on first page)
                 doc_field_regions: List[ExtractedRegion] = []
@@ -458,6 +565,10 @@ def process_form(pdf_path: str, output_dir: str = "output", *, debug: bool = Fal
                         "first_page": int(first_idx),
                         "logo_detected": bool(first_meta.get("logo_detected", False)),
                         "logo_confidence": float(first_meta.get("logo_confidence", 0.0) or 0.0),
+                        "needs_manual_review": bool(
+                            bool(first_meta.get("logo_detected", False))
+                            and str((first_meta.get("region_templates") or {}).get("status", "")) != "ok"
+                        ),
                         "extractions": {"fields": int(len(doc_field_regions)), "table_column_3": int(len(doc_table_regions))},
                     }
                 )
@@ -525,6 +636,7 @@ def process_form(pdf_path: str, output_dir: str = "output", *, debug: bool = Fal
                 "timestamp": datetime.now(timezone.utc).isoformat(),
                 "timings": {k: round(float(v), 3) for k, v in timings.items()},
                 "step2_zone_detection_detail": step2_detail,
+                "manual_review": manual_review,
                 "extractions": {
                     "fields": len(field_regions),
                     "table_column_3": len(table_regions),

@@ -92,23 +92,6 @@ class ZoneDetector:
                         # Update search window metadata to match the fallback method.
                         y_end = int(y_end2)
                         x_end = int(x_end2)
-                # Final fallback: fixed band (conservative) for first pages only.
-                if fields == (0, 0) and bool(getattr(config, "FIELDS_FALLBACK_ENABLED", True)):
-                    a, b = getattr(config, "FIELDS_FALLBACK_Y_FRAC", (0.35, 0.78))
-                    yy0 = int(round(float(h) * float(a)))
-                    yy1 = int(round(float(h) * float(b)))
-                    yy0 = max(0, min(yy0, h))
-                    yy1 = max(0, min(yy1, h))
-                    if yy1 > yy0:
-                        fields = (int(yy0), int(yy1))
-                        zone1_hits = []
-                        region_status = {
-                            **(region_status or {}),
-                            "status": "fallback_fixed_band",
-                            "method": "fixed_band",
-                            "used_templates": [],
-                            "band_y_frac": list(getattr(config, "FIELDS_FALLBACK_Y_FRAC", (0.35, 0.78))),
-                        }
             else:
                 # Continuation pages: treat as table-only (full page).
                 header = (0, 0)
@@ -226,7 +209,13 @@ class ZoneDetector:
                 header_y1 = int(round(float(h) * float(getattr(config, "LOGO_SEARCH_Y_FRAC", 0.20))))
                 header_y1 = max(1, min(header_y1, h))
                 header = (0, int(header_y1))
-                table = self._zone_px(h, config.TABLE_ZONE)
+                # Table search zone:
+                # - If logo was actually detected on this page, restrict to lower 50% (avoid header artifacts).
+                # - If this is a forced first page without logo, search whole page (more robust).
+                if bool(hit.get("has_logo", False)):
+                    table = (int(round(0.50 * float(h))), int(h))
+                else:
+                    table = (0, int(h))
                 y_end = int(
                     round(float(h) * float(getattr(config, "REGION_TEMPLATE_SEARCH_Y_FRAC", getattr(config, "ZONE1_TEMPLATE_SEARCH_Y_FRAC", 0.65))))
                 )
@@ -244,50 +233,16 @@ class ZoneDetector:
                 )
                 region_time_total += float(time.perf_counter() - t0)
                 n_region_pages += 1
-                # Fallback: if region templates fail, try zone-1 templates (template_4/template_5).
-                # This helps when region anchors are missing on some first pages, while still avoiding
-                # overly broad dot detection that can create false positives.
-                if fields == (0, 0):
-                    y_end2 = int(round(float(h) * float(getattr(config, "ZONE1_TEMPLATE_SEARCH_Y_FRAC", 0.65))))
-                    y_end2 = max(1, min(y_end2, h))
-                    x_end2 = int(round(float(w) * float(getattr(config, "ZONE1_TEMPLATE_SEARCH_X_FRAC", 0.5))))
-                    x_end2 = max(1, min(x_end2, w))
-                    fields2, hits2 = self._infer_fields_zone_from_zone1_templates(
-                        page, search_zone=(0, int(y_end2)), search_x_end=int(x_end2)
-                    )
-                    if fields2 != (0, 0):
-                        fields = fields2
-                        zone1_hits = hits2
-                        region_status = {
-                            **(region_status or {}),
-                            "status": "fallback_zone1_templates",
-                            "method": "zone1_templates",
-                            "used_templates": [str(h.get("template_file", "")) for h in (hits2 or []) if str(h.get("template_file", ""))],
-                            "threshold": float(getattr(config, "ZONE1_TEMPLATE_THRESHOLD", 0.60)),
-                        }
-                        y_end = int(y_end2)
-                        x_end = int(x_end2)
-                # Final fallback: fixed band (conservative) for first pages only.
-                if fields == (0, 0) and bool(getattr(config, "FIELDS_FALLBACK_ENABLED", True)):
-                    a, b = getattr(config, "FIELDS_FALLBACK_Y_FRAC", (0.35, 0.78))
-                    yy0 = int(round(float(h) * float(a)))
-                    yy1 = int(round(float(h) * float(b)))
-                    yy0 = max(0, min(yy0, h))
-                    yy1 = max(0, min(yy1, h))
-                    if yy1 > yy0:
-                        fields = (int(yy0), int(yy1))
-                        zone1_hits = []
-                        region_status = {
-                            **(region_status or {}),
-                            "status": "fallback_fixed_band",
-                            "method": "fixed_band",
-                            "used_templates": [],
-                            "band_y_frac": list(getattr(config, "FIELDS_FALLBACK_Y_FRAC", (0.35, 0.78))),
-                        }
             else:
                 header = (0, 0)
                 fields = (0, 0)
-                table = (0, h)
+                # Table search zone:
+                # - If logo is detected on this page, restrict to lower 50% (avoid header artifacts).
+                # - Otherwise, search whole page.
+                if bool(hit.get("has_logo", False)):
+                    table = (int(round(0.50 * float(h))), int(h))
+                else:
+                    table = (0, int(h))
                 zone1_hits = []
                 x_end = 0
                 y_end = 0
