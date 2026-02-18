@@ -109,96 +109,6 @@ def _draw_logo_overlay(page_bgr: np.ndarray, *, bbox: list | tuple, confidence: 
     return out
 
 
-def _draw_region_template_diagnostics_overlay(page_bgr: np.ndarray, meta: Dict[str, Any]) -> np.ndarray:
-    """
-    Visualize region_begin/region_end template matching diagnostics on the page.
-
-    This uses `meta["region_templates"]["tried"][].best[]` so you can see best hits even when
-    they were rejected (below threshold / invalid order).
-    """
-    out = page_bgr.copy()
-    h, w = out.shape[:2]
-
-    # Draw search window (same as zone_detector used)
-    z1 = meta.get("zone1_template_search") or {}
-    x_end = int(z1.get("x_end") or w)
-    y_end = int(z1.get("y_end") or h)
-    x_end = max(1, min(x_end, w))
-    y_end = max(1, min(y_end, h))
-    cv2.rectangle(out, (0, 0), (x_end - 1, y_end - 1), (255, 0, 0), 2)
-
-    # Draw zones on top (lets you verify which band we will actually use/skip)
-    try:
-        out = _draw_zones(out, meta.get("zones") or {})
-    except Exception:
-        pass
-
-    rt = meta.get("region_templates") or {}
-    thr = rt.get("threshold", None)
-    method = str(rt.get("method", ""))
-    status = str(rt.get("status", ""))
-    used = rt.get("used_templates") or []
-    cv2.putText(
-        out,
-        f"region_templates: status={status} method={method} thr={thr} used={used}",
-        (10, 40),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.9,
-        (255, 0, 0),
-        2,
-        lineType=cv2.LINE_AA,
-    )
-
-    tried = rt.get("tried") or []
-    y_text = 80
-    for entry in tried:
-        tag = str(entry.get("tag", ""))
-        files = entry.get("files") or ["", ""]
-        accepted = entry.get("accepted") or [False, False]
-        best = entry.get("best") or [None, None]
-        reason = str(entry.get("reason", ""))
-
-        cv2.putText(
-            out,
-            f"{tag} files={files} accepted={accepted} reason={reason}",
-            (10, y_text),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.8,
-            (0, 0, 255) if reason else (0, 180, 0),
-            2,
-            lineType=cv2.LINE_AA,
-        )
-        y_text += 30
-
-        for j in (0, 1):
-            b = best[j] or None
-            if not b:
-                continue
-            try:
-                x, y, bw, bh = b.get("bbox") or (0, 0, 0, 0)
-                x, y, bw, bh = int(x), int(y), int(bw), int(bh)
-                conf = float(b.get("confidence", 0.0))
-                sc = float(b.get("scale", 1.0))
-                tf = str(b.get("template_file", ""))
-            except Exception:
-                continue
-            # bbox is ROI-relative (roi starts at 0,0 on the page)
-            color = (0, 200, 0) if bool(accepted[j]) else (0, 0, 255)
-            cv2.rectangle(out, (x, y), (x + bw, y + bh), color, 3)
-            cv2.putText(
-                out,
-                f"{Path(tf).name} {conf:.3f} s={sc:.2f}",
-                (x, max(20, y - 6)),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.7,
-                color,
-                2,
-                lineType=cv2.LINE_AA,
-            )
-
-    return out
-
-
 def structure_results(
     field_regions: List[ExtractedRegion],
     table_regions: List[ExtractedRegion],
@@ -256,6 +166,19 @@ def process_form(pdf_path: str, output_dir: str = "output", *, debug: bool = Fal
     setup_logging()
     out_root = ensure_dir(output_dir)
     debug_root = ensure_dir(out_root / "debug_output") if debug else None
+    # Keep debug_output lean: remove legacy/low-signal artifacts from previous runs.
+    if debug_root is not None:
+        cleanup_patterns = [
+            "*_region_templates_best_overlay.jpg",
+            "*_templates_best_overlay.jpg",
+            "*_last_column_highlighted.jpg",
+        ]
+        for pat in cleanup_patterns:
+            for p in list(Path(debug_root).glob(pat)):
+                try:
+                    p.unlink()
+                except Exception:
+                    pass
 
     timings: Dict[str, float] = {}
     step2_detail: Dict[str, Any] = {}
@@ -368,11 +291,6 @@ def process_form(pdf_path: str, output_dir: str = "output", *, debug: bool = Fal
                             ),
                             m.get("zones") or {},
                         ),
-                    )
-                    # Best-hit diagnostics overlay (shows best matches even if rejected)
-                    save_image(
-                        debug_root / f"page_{p:02d}_doc_{did0+1:02d}_page_{doc_local:02d}_region_templates_best_overlay.jpg",
-                        _draw_region_template_diagnostics_overlay(img, m),
                     )
                     save_image(
                         debug_root / f"page_{p:02d}_zone1_fields_zone.jpg",
@@ -547,10 +465,6 @@ def process_form(pdf_path: str, output_dir: str = "output", *, debug: bool = Fal
                     row_offset += len(page_cells)
 
                     if debug_root is not None and page_cells:
-                        overlay = img.copy()
-                        x0, x1 = struct.target_column
-                        cv2.rectangle(overlay, (int(x0), int(struct.bbox.y)), (int(x1), int(struct.bbox.y2)), (0, 255, 0), 6)
-                        save_image(debug_root / f"page_{page_num+1:02d}_last_column_highlighted.jpg", overlay)
                         for r in page_cells[:12]:
                             save_image(debug_root / f"{r.region_id}_raw.jpg", r.raw_image)
                             save_image(debug_root / f"{r.region_id}_preprocessed.jpg", r.image)
