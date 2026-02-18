@@ -44,9 +44,15 @@ def ensure_dir(path: str | Path) -> Path:
 def save_image(path: str | Path, img: np.ndarray) -> None:
     p = Path(path)
     p.parent.mkdir(parents=True, exist_ok=True)
-    ok = cv2.imwrite(str(p), img)
-    if not ok:
-        raise IOError(f"Failed to write image: {p}")
+    tmp = p.with_name(p.stem + "_tmp" + p.suffix)
+    try:
+        ok = cv2.imwrite(str(tmp), img)
+        if not ok:
+            raise IOError(f"Failed to write image: {p}")
+        os.replace(str(tmp), str(p))
+    except Exception:
+        tmp.unlink(missing_ok=True)
+        raise
 
 
 def to_jsonable(x: Any) -> Any:
@@ -70,7 +76,14 @@ def to_jsonable(x: Any) -> Any:
 def save_json(path: str | Path, payload: Any, *, indent: int = 2) -> None:
     p = Path(path)
     p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(json.dumps(to_jsonable(payload), ensure_ascii=False, indent=indent), encoding="utf-8")
+    text = json.dumps(to_jsonable(payload), ensure_ascii=False, indent=indent)
+    tmp = p.with_name(p.stem + "_tmp" + p.suffix)
+    try:
+        tmp.write_text(text, encoding="utf-8")
+        os.replace(str(tmp), str(p))
+    except Exception:
+        tmp.unlink(missing_ok=True)
+        raise
 
 
 def env_flag(name: str, default: bool = False) -> bool:
