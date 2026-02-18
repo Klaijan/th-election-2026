@@ -126,14 +126,6 @@ class TableDetector:
             return ((int(xs[idx]), int(xs[idx + 1])), int(idx))
         raise ValueError(f"Unsupported TABLE_TARGET_COLUMN mode: {mode}")
 
-    def check_table_continuation(self, prev: TableStructure, curr: TableStructure) -> bool:
-        (p0, p1) = prev.target_column
-        (c0, c1) = curr.target_column
-        tol = int(config.TABLE_COLUMN_ALIGNMENT_TOLERANCE)
-        same_cols = int(prev.cols) == int(curr.cols)
-        aligned = abs(int(p0) - int(c0)) <= tol and abs(int(p1) - int(c1)) <= tol
-        return bool(same_cols and aligned)
-
     @staticmethod
     def _binarize_for_lines(gray: np.ndarray) -> np.ndarray:
         inv = cv2.bitwise_not(gray)
