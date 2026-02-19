@@ -2,11 +2,12 @@
 
 Snapshot from `survey_gdrive.py` scans on 2026-02-19.
 
+Source: <https://www.ect.go.th/ect_th/th/election-2026/>
+
 ## Overview
 
-- **170,033 files** across **76 unique folders** (77 provinces, all scanned)
-- **486.44 GB** total size (deduplicated)
-- 2 empty folders (แม่ฮ่องสอน, ระนอง)
+- **176,127 files** across **77 unique folders** (77 provinces, all scanned)
+- **511.80 GB** total size (deduplicated)
 
 ## Tracked reports
 

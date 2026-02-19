@@ -2,6 +2,11 @@
 
 Extract structured data from Thai election form PDFs (สส.5/18, สส.5/11) published by the Election Commission of Thailand (กกต.) and make it available as open data.
 
+### Data source
+
+Province-level Google Drive folders are published by ECT at:
+<https://www.ect.go.th/ect_th/th/election-2026/>
+
 ### Which path should I use?
 
 | Path | Script | Output | When to use |
