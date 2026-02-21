@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import logging
-from typing import Dict, List, Tuple
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
 
 from . import config
 from .types import Box, TableStructure
+
+if TYPE_CHECKING:
+    from .color_separator import InkMasks
 
 log = logging.getLogger("extract_handwritten_numbers")
 
@@ -24,7 +27,13 @@ class TableDetector:
     def __init__(self) -> None:
         pass
 
-    def detect_table_boundary(self, image: np.ndarray, zone: Tuple[int, int]) -> Box:
+    def detect_table_boundary(
+        self,
+        image: np.ndarray,
+        zone: Tuple[int, int],
+        *,
+        ink_masks: Optional["InkMasks"] = None,
+    ) -> Box:
         y0, y1 = int(zone[0]), int(zone[1])
         h, w = image.shape[:2]
         y0 = max(0, min(y0, h))
@@ -33,8 +42,12 @@ class TableDetector:
         if roi.size == 0:
             return Box(x=0, y=y0, w=w, h=max(0, y1 - y0))
 
-        gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-        bw = self._binarize_for_lines(gray)
+        if ink_masks is not None and ink_masks.has_blue:
+            # Use black mask directly — grid lines are black
+            bw = ink_masks.black[y0:y1, :]
+        else:
+            gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+            bw = self._binarize_for_lines(gray)
         vert, horiz, grid = self._detect_grid_masks(bw)
 
         contours, _ = cv2.findContours(grid, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -61,14 +74,23 @@ class TableDetector:
         box = Box(x=int(x - pad), y=int(y0 + y - pad), w=int(ww + pad * 2), h=int(hh + pad * 2))
         return box.clamp(width=w, height=h)
 
-    def parse_table_structure(self, image: np.ndarray, table_bbox: Box) -> TableStructure:
+    def parse_table_structure(
+        self,
+        image: np.ndarray,
+        table_bbox: Box,
+        *,
+        ink_masks: Optional["InkMasks"] = None,
+    ) -> TableStructure:
         h, w = image.shape[:2]
         box = table_bbox.clamp(width=w, height=h)
         table = image[box.y : box.y2, box.x : box.x2]
         if table.size == 0:
             raise ValueError("Empty table crop")
 
-        grid = self.detect_grid_lines(table)
+        black_crop = None
+        if ink_masks is not None and ink_masks.has_blue:
+            black_crop = ink_masks.black[box.y : box.y2, box.x : box.x2]
+        grid = self.detect_grid_lines(table, ink_masks_crop=black_crop)
         horiz_local = grid["horizontal"]
         vert_local = grid["vertical"]
         horiz_abs = [int(box.y + y) for y in horiz_local]
@@ -87,9 +109,18 @@ class TableDetector:
             cols=int(cols),
         )
 
-    def detect_grid_lines(self, table_bgr: np.ndarray) -> Dict[str, List[int]]:
-        gray = cv2.cvtColor(table_bgr, cv2.COLOR_BGR2GRAY)
-        bw = self._binarize_for_lines(gray)
+    def detect_grid_lines(
+        self,
+        table_bgr: np.ndarray,
+        *,
+        ink_masks_crop: Optional[np.ndarray] = None,
+    ) -> Dict[str, List[int]]:
+        if ink_masks_crop is not None:
+            # Pre-cropped black mask provided
+            bw = ink_masks_crop
+        else:
+            gray = cv2.cvtColor(table_bgr, cv2.COLOR_BGR2GRAY)
+            bw = self._binarize_for_lines(gray)
         vert, horiz, _grid = self._detect_grid_masks(bw)
 
         # Projections (how much line ink per col/row)

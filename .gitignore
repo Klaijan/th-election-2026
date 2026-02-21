@@ -35,3 +35,5 @@ service-account*.json
 !data/survey_gdrive.csv
 !data/folder_owners.csv
 !data/gdrive_files_summary.md
+!data/ground_truth/
+!data/ground_truth/**

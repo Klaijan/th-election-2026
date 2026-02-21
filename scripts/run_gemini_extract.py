@@ -10,7 +10,6 @@ import random
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
@@ -278,6 +277,15 @@ def extract_page_ollama(
 # ---------------------------------------------------------------------------
 
 
+def _try_parse_dirpath(rel: str) -> dict[str, Any]:
+    """Best-effort directory metadata extraction. Returns empty dict on failure."""
+    try:
+        from parse_dirpath import parse_election_path
+        return parse_election_path(rel)
+    except Exception:
+        return {}
+
+
 def build_work_items(
     input_path: Path,
     done_set: set[tuple[str, int, str]],
@@ -298,18 +306,25 @@ def build_work_items(
         doc = fitz.open(str(pdf))
         n_pages = doc.page_count
         doc.close()
+
+        # Parse directory-derived metadata once per PDF
+        dir_meta = _try_parse_dirpath(rel)
+
         for idx in range(0, n_pages, 2):  # 0-indexed → odd pages (1,3,5,...)
             page_num = idx + 1
             if (rel, page_num, fp) in done_set:
                 continue
-            items.append({
+            item: dict[str, Any] = {
                 "pdf_path": pdf,
                 "rel_path": rel,
                 "page_idx": idx,
                 "page_num": page_num,
                 "fingerprint": fp,
                 "n_pages": n_pages,
-            })
+            }
+            if dir_meta:
+                item["dir_meta"] = dir_meta
+            items.append(item)
     return items
 
 
@@ -346,7 +361,7 @@ def process_one(
                 retries=retries,
                 retry_base_sleep=retry_base_sleep,
             )
-        return {
+        result = {
             "rel_path": item["rel_path"],
             "page_num": item["page_num"],
             "fingerprint": item["fingerprint"],
@@ -355,6 +370,9 @@ def process_one(
             "model": model_name,
             "seconds": round(time.time() - t0, 3),
         }
+        if "dir_meta" in item:
+            result["dir_meta"] = item["dir_meta"]
+        return result
     except Exception as e:
         return {
             "rel_path": item["rel_path"],
