@@ -1,0 +1,89 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Ground Truth Annotation",
+  "description": "One annotation per ballot form page (key = rel_path + page_num).",
+  "type": "object",
+  "required": ["rel_path", "page_num", "source", "annotated_at", "voter_stats"],
+  "properties": {
+    "rel_path": {
+      "type": "string",
+      "description": "Relative path to the source PDF (matches Gemini manifest rel_path)."
+    },
+    "page_num": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "1-based page number within the PDF."
+    },
+    "source": {
+      "type": "string",
+      "enum": ["human", "bootstrap_agree", "bootstrap_reviewed"],
+      "description": "How this annotation was created."
+    },
+    "annotator": {
+      "type": ["string", "null"],
+      "description": "Human annotator identifier (null for bootstrap)."
+    },
+    "annotated_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "ISO-8601 timestamp of annotation."
+    },
+    "metadata": {
+      "type": "object",
+      "properties": {
+        "province": { "type": ["string", "null"] },
+        "constituency": { "type": ["integer", "null"] },
+        "amphoe": { "type": ["string", "null"] },
+        "tambon": { "type": ["string", "null"] },
+        "unit_number": { "type": ["integer", "null"] },
+        "form_type": {
+          "type": ["string", "null"],
+          "enum": ["district", "partylist", null]
+        },
+        "ink_type": {
+          "type": ["string", "null"],
+          "enum": ["blue", "black", "bw", null]
+        },
+        "scan_quality": {
+          "type": ["string", "null"],
+          "enum": ["good", "fair", "poor", null]
+        }
+      },
+      "additionalProperties": false
+    },
+    "voter_stats": {
+      "type": "object",
+      "description": "Canonical voter statistics fields from BALLOT_FIELD_MAP_DISTRICT.",
+      "properties": {
+        "eligible_voters":  { "type": ["integer", "null"] },
+        "voters_appeared":  { "type": ["integer", "null"] },
+        "ballots_allocated": { "type": ["integer", "null"] },
+        "ballots_used":     { "type": ["integer", "null"] },
+        "valid_ballots":    { "type": ["integer", "null"] },
+        "invalid_ballots":  { "type": ["integer", "null"] },
+        "no_vote_ballots":  { "type": ["integer", "null"] },
+        "ballots_remaining": { "type": ["integer", "null"] }
+      },
+      "additionalProperties": false
+    },
+    "candidates": {
+      "type": ["array", "null"],
+      "description": "Candidate vote counts (null = table not annotated).",
+      "items": {
+        "type": "object",
+        "required": ["number", "votes"],
+        "properties": {
+          "number": { "type": "integer", "minimum": 1 },
+          "votes": { "type": ["integer", "null"] }
+        },
+        "additionalProperties": false
+      }
+    },
+    "flags": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Free-form flags for issues or notes."
+    }
+  },
+  "additionalProperties": false
+}
