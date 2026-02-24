@@ -92,6 +92,21 @@ OCR_LANGUAGES: list[str] = ["th"]
 OCR_CONFIDENCE_THRESHOLD: float = 0.70
 
 # -------------------------
+# Ballot field mapping (สส.5/18 district form)
+# 0-indexed positions of dotted-line fields top-to-bottom.
+# -------------------------
+BALLOT_FIELD_MAP_DISTRICT: dict[int, str] = {
+    0: "eligible_voters",      # 1.1 ผู้มีสิทธิตามบัญชี
+    1: "voters_appeared",      # 1.2 ผู้มาแสดงตน
+    2: "ballots_allocated",    # 2.1 บัตรที่ได้รับจัดสรร
+    3: "ballots_used",         # 2.2 บัตรที่ใช้
+    4: "valid_ballots",        # 2.2.1 บัตรดี
+    5: "invalid_ballots",      # 2.2.2 บัตรเสีย
+    6: "no_vote_ballots",      # 2.2.3 ไม่เลือกผู้สมัคร
+    7: "ballots_remaining",    # 2.3 บัตรที่เหลือ
+}
+
+# -------------------------
 # Validation rules
 # -------------------------
 FIELD_VALUE_RANGE = (0, 10_000)

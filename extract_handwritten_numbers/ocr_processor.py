@@ -60,6 +60,31 @@ class OCRProcessor:
         self.languages = list(languages or config.OCR_LANGUAGES)
         self._credentials_path = credentials_path
 
+    @staticmethod
+    def _prepare_for_ocr(img: np.ndarray) -> np.ndarray:
+        """Normalize an image for OCR: grayscale, polarity, size, border."""
+        if img.size == 0:
+            return img
+        # 1. Convert to grayscale
+        if img.ndim == 3:
+            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        else:
+            gray = img.copy()
+        # 2. Polarity fix: ensure dark text on white background
+        if float(np.mean(gray)) < 128:
+            gray = cv2.bitwise_not(gray)
+        # 3. Upscale if too small
+        h = gray.shape[0]
+        min_h = int(config.OCR_PREP_MIN_HEIGHT_PX)
+        if h > 0 and h < min_h:
+            scale = min_h / h
+            gray = cv2.resize(gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+        # 4. Add white border
+        border = int(config.OCR_PREP_BORDER_PX)
+        if border > 0:
+            gray = cv2.copyMakeBorder(gray, border, border, border, border, cv2.BORDER_CONSTANT, value=255)
+        return gray
+
     def batch_ocr(self, images: List[np.ndarray], image_ids: List[str], *, retries: int = 3) -> Dict[str, OCRItem]:
         if len(images) != len(image_ids):
             raise ValueError("images and image_ids length mismatch")
@@ -99,7 +124,8 @@ class OCRProcessor:
 
         requests = []
         for img in images:
-            ok, buf = cv2.imencode(".jpg", img, [int(cv2.IMWRITE_JPEG_QUALITY), 92])
+            prepared = self._prepare_for_ocr(img)
+            ok, buf = cv2.imencode(".jpg", prepared, [int(cv2.IMWRITE_JPEG_QUALITY), 92])
             if not ok:
                 raise RuntimeError("cv2.imencode(.jpg) failed")
             req = vision.AnnotateImageRequest(
