@@ -82,29 +82,6 @@ class ZoneDetector:
                 )
                 t_region_templates += float(time.perf_counter() - t0)
                 n_region_pages += 1
-                # Fallback: if region templates fail, try zone-1 templates (template_4/template_5).
-                # Still do NOT fall back to a broad band; if both fail, keep fields=(0,0).
-                if fields == (0, 0):
-                    y_end2 = int(round(float(h) * float(getattr(config, "ZONE1_TEMPLATE_SEARCH_Y_FRAC", 0.65))))
-                    y_end2 = max(1, min(y_end2, h))
-                    x_end2 = int(round(float(w) * float(getattr(config, "ZONE1_TEMPLATE_SEARCH_X_FRAC", 0.5))))
-                    x_end2 = max(1, min(x_end2, w))
-                    fields2, hits2 = self._infer_fields_zone_from_zone1_templates(
-                        page, search_zone=(0, int(y_end2)), search_x_end=int(x_end2)
-                    )
-                    if fields2 != (0, 0):
-                        fields = fields2
-                        zone1_hits = hits2
-                        region_status = {
-                            **(region_status or {}),
-                            "status": "fallback_zone1_templates",
-                            "method": "zone1_templates",
-                            "used_templates": [str(h.get("template_file", "")) for h in (hits2 or []) if str(h.get("template_file", ""))],
-                            "threshold": float(getattr(config, "ZONE1_TEMPLATE_THRESHOLD", 0.60)),
-                        }
-                        # Update search window metadata to match the fallback method.
-                        y_end = int(y_end2)
-                        x_end = int(x_end2)
             else:
                 # Continuation pages: treat as table-only (full page).
                 header = (0, 0)
@@ -155,7 +132,14 @@ class ZoneDetector:
         if not pages:
             return []
 
-        use_logo = len(pages) >= int(getattr(config, "MIN_PAGES_FOR_LOGO_DETECTION", 3))
+        min_pages_for_logo = int(getattr(config, "MIN_PAGES_FOR_LOGO_DETECTION", 3))
+        use_logo = len(pages) >= int(min_pages_for_logo)
+        if not bool(use_logo):
+            log.info(
+                "Skipping logo detection: pages=%d < MIN_PAGES_FOR_LOGO_DETECTION=%d (treating as single document).",
+                int(len(pages)),
+                int(min_pages_for_logo),
+            )
         logo = LogoDetector()
 
         min_gap = int(getattr(config, "LOGO_MIN_PAGE_GAP", 1))
@@ -309,6 +293,8 @@ class ZoneDetector:
         t_total = float(time.perf_counter() - t_total0)
         self.last_step2_breakdown = {
             "mode": "multi_document_logo",
+            "logo_detection_enabled": bool(use_logo),
+            "min_pages_for_logo_detection": int(min_pages_for_logo),
             "total_s": float(t_total),
             "logo_detection_s": float(logo_time_total),
             "logo_detection_pages": int(n_logo_pages),
@@ -636,7 +622,7 @@ class ZoneDetector:
         if not hits:
             cv2.putText(
                 out,
-                "ZONE1 TEMPLATE HITS: NONE (fallback zone used)",
+                "TEMPLATE HITS: NONE (manual review flagged in result.json)",
                 (10, max(70, y0 + 70)),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.9,

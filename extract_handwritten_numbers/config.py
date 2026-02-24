@@ -38,7 +38,7 @@ ZONE1_TEMPLATE_SEARCH_Y_FRAC: float = 0.65  # search top 65% of the page
 # These anchors define the top/bottom of the "fields" region on first pages.
 REGION_TEMPLATE_FILES_1: tuple[str, str] = ("region_begin.png", "region_end.png")
 REGION_TEMPLATE_FILES_2: tuple[str, str] = ("region_begin_2.png", "region_end_2.png")
-REGION_TEMPLATE_THRESHOLD: float = 0.60
+REGION_TEMPLATE_THRESHOLD: float = 0.70
 # Match debug_template_match.py defaults: 0.50..2.50 step 0.05
 REGION_TEMPLATE_SCALE_RANGE: tuple[float, float, float] = (0.50, 2.50, 0.05)  # (min, max, step)
 # Fallback discrete list (used only if REGION_TEMPLATE_SCALE_RANGE is missing/invalid)
@@ -87,7 +87,8 @@ TABLE_MIN_VERT_KERNEL: int = 40
 # OCR
 # -------------------------
 OCR_PROVIDER: str = "google"
-OCR_LANGUAGES: list[str] = ["th", "en"]
+# OCR language hints. This pipeline is tuned for Thai forms; keep strictly Thai.
+OCR_LANGUAGES: list[str] = ["th"]
 OCR_CONFIDENCE_THRESHOLD: float = 0.70
 
 # -------------------------
@@ -108,7 +109,7 @@ DEBUG_SAVE_INTERMEDIATES: bool = False
 LOGO_TEMPLATE_FILE: str = "logo.png"
 # Detect logo only in top band of the page (fraction of height)
 # Search only top band of the page for the crest logo (speed + fewer false positives).
-LOGO_SEARCH_Y_FRAC: float = 0.20
+LOGO_SEARCH_Y_FRAC: float = 0.25
 # Template match threshold (TM_CCOEFF_NORMED)
 LOGO_DETECTION_THRESHOLD: float = 0.70
 # Downscale factor for logo template matching (speed); 0.25 = 4x smaller each axis (~16x faster).
@@ -123,6 +124,10 @@ LOGO_SCALE_RANGE: tuple[float, float, float] = (0.50, 2.50, 0.05)  # (min, max, 
 LOGO_SCALES: tuple[float, ...] = (0.80, 0.90, 1.00, 1.10, 1.20, 1.40, 1.60, 1.75, 2.00)
 
 # Only enable logo-based multi-document split for PDFs with at least this many pages.
+# Many constituency forms are 2 pages (page-1 form + page-2 signatures). Enabling logo
+# detection for 2-page PDFs improves debug output (logo_confidence/bbox) and allows
+# consistent behavior across small batches, while still being protected from false splits
+# by ALWAYS_TREAT_PAGE0_AS_FIRST + "skip next page" logic.
 MIN_PAGES_FOR_LOGO_DETECTION: int = 3
 # Always treat page 0 as a first page (safety).
 ALWAYS_TREAT_PAGE0_AS_FIRST: bool = True

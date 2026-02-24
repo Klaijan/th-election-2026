@@ -34,6 +34,13 @@ def _digits_only(s: str) -> str:
     return "".join(c for c in s if c.isdigit() or c == ".")
 
 
+def _normalize_thai_digits(s: str) -> str:
+    """
+    Convert Thai numerals to ASCII numerals, preserving all other characters.
+    """
+    return (s or "").translate(_THAI_DIGITS)
+
+
 class OCRProcessor:
     """
     Batch OCR handler.
@@ -148,9 +155,10 @@ class OCRProcessor:
                 raw = str(r.text_annotations[0].description or "")
 
             conf = self._estimate_google_confidence(r)
+            norm = _normalize_thai_digits(raw)
             out[img_id] = OCRItem(
                 image_id=img_id,
-                text=_digits_only(raw),
+                text=norm,
                 raw_text=raw,
                 confidence=float(conf),
                 provider="google",
@@ -185,6 +193,27 @@ class OCRProcessor:
         except ModuleNotFoundError as e:  # pragma: no cover
             raise RuntimeError("Tesseract fallback requested but pytesseract is not installed") from e
 
+        def _tess_langs(langs: List[str]) -> str:
+            # Map BCP47-ish hints to Tesseract language packs.
+            # Thai is `tha` in Tesseract traineddata.
+            mapped: List[str] = []
+            for l in (langs or []):
+                x = str(l or "").strip().lower()
+                if not x:
+                    continue
+                if x in {"th", "tha"}:
+                    mapped.append("tha")
+                else:
+                    mapped.append(x)
+            # Deduplicate while preserving order.
+            out: List[str] = []
+            for x in mapped:
+                if x not in out:
+                    out.append(x)
+            return "+".join(out) if out else "tha"
+
+        tess_lang = _tess_langs(self.languages)
+
         out: Dict[str, OCRItem] = {}
         for img, img_id in zip(images, image_ids):
             # Make sure it's single-channel uint8
@@ -192,12 +221,15 @@ class OCRProcessor:
                 gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
             else:
                 gray = img
-            txt = pytesseract.image_to_string(
-                gray,
-                lang="eng",
-                config="--oem 3 --psm 6 -c tessedit_char_whitelist=0123456789.",
+            # Note: we intentionally do NOT restrict to digits-only; downstream parsing can extract digits as needed.
+            txt = pytesseract.image_to_string(gray, lang=str(tess_lang), config="--oem 3 --psm 6")
+            out[img_id] = OCRItem(
+                image_id=img_id,
+                text=_normalize_thai_digits(txt),
+                raw_text=txt,
+                confidence=0.0,
+                provider="tesseract",
             )
-            out[img_id] = OCRItem(image_id=img_id, text=_digits_only(txt), raw_text=txt, confidence=0.0, provider="tesseract")
         return out
 
 

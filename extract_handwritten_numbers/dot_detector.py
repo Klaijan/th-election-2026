@@ -16,6 +16,11 @@ class DotDetector:
     """
     Detect dotted horizontal lines inside a given vertical zone.
 
+    NOTE (2026-02): This detector is no longer used by the main OCR pipeline
+    (`extract_handwritten_numbers/main.py`). The pipeline now uses a larger
+    "fields band" crop strategy instead of per-dotted-line crops.
+    This module is kept as legacy/reference code and for potential future reuse.
+
     Strategy:
     - Find individual dot blobs using connected components (size + circularity filtering)
     - Group dot centers into horizontal sequences based on y proximity and x spacing

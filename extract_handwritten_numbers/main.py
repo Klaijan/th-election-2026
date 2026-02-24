@@ -11,7 +11,6 @@ import cv2
 import numpy as np
 
 from . import config
-from .field_extractor import FieldExtractor
 from .ocr_processor import OCRProcessor
 from .pdf_loader import PDFCorruptedError, PDFLoader, PDFPasswordError
 from .table_detector import TableDetector
@@ -20,7 +19,6 @@ from .types import Box, ExtractedRegion, TableStructure
 from .utils import Timer, ensure_dir, save_image, save_json, setup_logging
 from .validator import Validator
 from .zone_detector import ZoneDetector
-from .dot_detector import DotDetector
 
 log = logging.getLogger("extract_handwritten_numbers")
 
@@ -92,17 +90,82 @@ def _draw_logo_overlay(page_bgr: np.ndarray, *, bbox: list | tuple, confidence: 
     try:
         x, y, w, h = (int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3]))
     except Exception:
-        return out
-    if w <= 0 or h <= 0:
-        return out
-    cv2.rectangle(out, (x, y), (x + w, y + h), (0, 0, 255), 5)
+        x, y, w, h = (0, 0, 0, 0)
+
+    # Always print confidence (even when bbox is missing/invalid).
+    label = f"LOGO {float(confidence):.2f}"
     cv2.putText(
         out,
-        f"LOGO {float(confidence):.2f}",
-        (x, max(30, y - 10)),
+        label,
+        (10 if (w <= 0 or h <= 0) else x, 40 if (w <= 0 or h <= 0) else max(30, y - 10)),
         cv2.FONT_HERSHEY_SIMPLEX,
         1.0,
         (0, 0, 255),
+        3,
+        lineType=cv2.LINE_AA,
+    )
+
+    if w > 0 and h > 0:
+        cv2.rectangle(out, (x, y), (x + w, y + h), (0, 0, 255), 5)
+    return out
+
+
+def _draw_last_column_overlay(page_bgr: np.ndarray, struct) -> np.ndarray:
+    """
+    Debug visualization for table extraction:
+    - table bbox
+    - vertical grid lines
+    - highlighted target ("last") column band
+    """
+    out = page_bgr.copy()
+    try:
+        bbox = getattr(struct, "bbox", None)
+        grid_v = list(getattr(struct, "grid_vertical", []) or [])
+        x0, x1 = getattr(struct, "target_column", (0, 0))
+        col_idx0 = int(getattr(struct, "target_column_index", -1))
+        cols = int(getattr(struct, "cols", 0) or 0)
+    except Exception:
+        return out
+
+    if bbox is None:
+        return out
+
+    try:
+        bx, by, bw, bh = int(bbox.x), int(bbox.y), int(bbox.w), int(bbox.h)
+    except Exception:
+        return out
+
+    if bw <= 0 or bh <= 0:
+        return out
+
+    # Highlight target column region (semi-transparent)
+    x0i, x1i = int(x0), int(x1)
+    x0i, x1i = (min(x0i, x1i), max(x0i, x1i))
+    if x1i > x0i:
+        overlay = out.copy()
+        cv2.rectangle(overlay, (x0i, by), (x1i, by + bh), (0, 255, 0), -1)
+        out = cv2.addWeighted(overlay, 0.25, out, 0.75, 0.0)
+
+    # Table bbox
+    cv2.rectangle(out, (bx, by), (bx + bw, by + bh), (0, 255, 255), 5)
+
+    # Vertical grid lines
+    for xv in grid_v:
+        xv = int(xv)
+        if bx <= xv <= (bx + bw):
+            cv2.line(out, (xv, by), (xv, by + bh), (255, 255, 0), 2)
+
+    # Target column outline
+    if x1i > x0i:
+        cv2.rectangle(out, (x0i, by), (x1i, by + bh), (0, 200, 0), 4)
+
+    cv2.putText(
+        out,
+        f"LAST COL idx0={col_idx0} cols={cols} x={x0i}..{x1i}",
+        (max(10, bx), max(40, by - 10)),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        1.0,
+        (0, 200, 0),
         3,
         lineType=cv2.LINE_AA,
     )
@@ -119,9 +182,11 @@ def structure_results(
         o = ocr_results.get(r.region_id)
         fields[r.region_id] = {
             "value": getattr(o, "text", "") if o else "",
+            "raw_text": getattr(o, "raw_text", "") if o else "",
             "confidence": float(getattr(o, "confidence", 0.0) if o else 0.0),
             "source": (r.meta.get("dot_line") or {}).get("y", None),
             "bbox": [int(r.bbox.x), int(r.bbox.y), int(r.bbox.w), int(r.bbox.h)],
+            "meta": (r.meta or {}),
         }
 
     col3 = []
@@ -135,8 +200,10 @@ def structure_results(
                 "column": str(r.meta.get("column_label", "last")),
                 "column_index_1based": int(r.meta.get("column_index_1based", 0)),
                 "value": getattr(o, "text", "") if o else "",
+                "raw_text": getattr(o, "raw_text", "") if o else "",
                 "confidence": float(getattr(o, "confidence", 0.0) if o else 0.0),
                 "bbox": [int(r.bbox.x), int(r.bbox.y), int(r.bbox.w), int(r.bbox.h)],
+                "meta": (r.meta or {}),
             }
         )
     col3.sort(key=lambda x: (int(x["page"]), int(x["row"])))
@@ -166,23 +233,12 @@ def process_form(pdf_path: str, output_dir: str = "output", *, debug: bool = Fal
     setup_logging()
     out_root = ensure_dir(output_dir)
     debug_root = ensure_dir(out_root / "debug_output") if debug else None
-    # Keep debug_output lean: remove legacy/low-signal artifacts from previous runs.
-    if debug_root is not None:
-        cleanup_patterns = [
-            "*_region_templates_best_overlay.jpg",
-            "*_templates_best_overlay.jpg",
-            "*_last_column_highlighted.jpg",
-        ]
-        for pat in cleanup_patterns:
-            for p in list(Path(debug_root).glob(pat)):
-                try:
-                    p.unlink()
-                except Exception:
-                    pass
 
     timings: Dict[str, float] = {}
     step2_detail: Dict[str, Any] = {}
     manual_review: List[Dict[str, Any]] = []
+    # For fallback crops when region templates fail.
+    band_pad_px = 20
 
     def _write_failure_result(err: str) -> Dict[str, Any]:
         """
@@ -198,6 +254,7 @@ def process_form(pdf_path: str, output_dir: str = "output", *, debug: bool = Fal
                 "timestamp": datetime.now(timezone.utc).isoformat(),
                 "timings": {k: round(float(v), 3) for k, v in timings.items()},
                 "step2_zone_detection_detail": step2_detail,
+                "manual_review": manual_review,
                 "extractions": {"fields": 0, "table_column_3": 0, "total": 0},
             },
         }
@@ -236,6 +293,55 @@ def process_form(pdf_path: str, output_dir: str = "output", *, debug: bool = Fal
             step2_detail = getattr(zone_detector, "last_step2_breakdown", {}) or {}
         timings["step2_zone_detection_s"] = float(t.dt or 0.0)
 
+        # Attach a fields-region bbox placeholder for each page.
+        # This is the "fields band" bbox (full width) when available; later we may overwrite it
+        # with a fallback band crop bbox when region templates fail.
+        for m in (page_meta or []):
+            try:
+                w, h = (m.get("page_size") or (0, 0))
+                w = int(w)
+                h = int(h)
+            except Exception:
+                w, h = (0, 0)
+            zones = m.get("zones") or {}
+            fy0, fy1 = (zones.get("fields") or (0, 0))
+            try:
+                fy0, fy1 = int(fy0), int(fy1)
+            except Exception:
+                fy0, fy1 = (0, 0)
+            if w > 0 and h > 0 and int(fy1) > int(fy0):
+                m["fields_region_bbox"] = [0, int(fy0), int(w), int(fy1 - fy0)]
+                m["fields_region_source"] = "region_templates"
+            else:
+                m["fields_region_bbox"] = [0, 0, 0, 0]
+                m["fields_region_source"] = "none"
+            # Will be filled during extraction when available.
+            m["table_bbox"] = m.get("table_bbox") or [0, 0, 0, 0]
+            m["last_column_bbox"] = m.get("last_column_bbox") or [0, 0, 0, 0]
+            m["last_column_index_0based"] = int(m.get("last_column_index_0based", -1) or -1)
+
+        # Flag first-page template failures for manual inspection.
+        # We intentionally do NOT fall back to other template sets for defining the fields band.
+        for m in (page_meta or []):
+            is_first = bool(m.get("is_first_page", False)) or int(m.get("page_num", 0) or 0) == 0
+            if not bool(is_first):
+                continue
+            rt = m.get("region_templates") or {}
+            rt_status = str(rt.get("status", "") or "")
+            fields_zone = (m.get("zones") or {}).get("fields", (0, 0))
+            fields_missing = bool(tuple(fields_zone) == (0, 0))
+            if fields_missing and rt_status not in ("ok", "n/a"):
+                manual_review.append(
+                    {
+                        "document_id": int(m.get("document_id", 0) or 0),
+                        "page": int(m.get("page_num", 0) or 0),
+                        "reason": "fields_zone_templates_not_found",
+                        "logo_detected": bool(m.get("logo_detected", False)),
+                        "logo_confidence": float(m.get("logo_confidence", 0.0) or 0.0),
+                        "region_templates": rt,
+                    }
+                )
+
         if debug_root is not None:
             # Precompute doc-local page index for filename scheme.
             doc_pages_sorted: dict[int, list[int]] = {}
@@ -248,7 +354,6 @@ def process_form(pdf_path: str, output_dir: str = "output", *, debug: bool = Fal
             for m, img in zip(page_meta, pages):
                 p = int(m["page_num"]) + 1
                 save_image(debug_root / f"page_{p:02d}_original.jpg", img)
-                save_image(debug_root / f"page_{p:02d}_zones_marked.jpg", _draw_zones(img, m["zones"]))
 
                 # Save logo overlay (requested), using multi-doc filename scheme:
                 # page_{global}_doc_{doc}_page_{doc_local}
@@ -268,7 +373,7 @@ def process_form(pdf_path: str, output_dir: str = "output", *, debug: bool = Fal
                     ),
                 )
                 if bool(m.get("is_first_page", p == 1)):
-                    # Always write zone-1 template debug on first pages (one per document), even if there are no hits.
+                    # Always write region template debug on first pages (one per document), even if there are no hits.
                     z1 = m.get("zone1_template_search") or {}
                     search_y = int(z1.get("y_end") or img.shape[0])
                     search_x = int(z1.get("x_end") or img.shape[1])
@@ -276,25 +381,17 @@ def process_form(pdf_path: str, output_dir: str = "output", *, debug: bool = Fal
                     search_x = max(1, min(search_x, int(img.shape[1])))
                     search_zone = (0, int(search_y))
                     save_image(
-                        debug_root / f"page_{p:02d}_zone1_templates_detected.jpg",
-                        zone_detector.visualize_zone1_template_hits(
-                            img, m.get("zone1_template_hits") or [], search_zone, search_x
-                        ),
-                    )
-                    # Also save with doc-style naming (helps multi-form PDFs). Note: zone1_template_hits will contain
-                    # region_begin/end hits on logo-detected pages (by design).
-                    save_image(
                         debug_root / f"page_{p:02d}_doc_{did0+1:02d}_page_{doc_local:02d}_region_templates_detected.jpg",
-                        _draw_zones(
-                            zone_detector.visualize_zone1_template_hits(
-                                img, m.get("zone1_template_hits") or [], search_zone, search_x
+                        _draw_logo_overlay(
+                            _draw_zones(
+                                zone_detector.visualize_zone1_template_hits(
+                                    img, m.get("zone1_template_hits") or [], search_zone, search_x
+                                ),
+                                m.get("zones") or {},
                             ),
-                            m.get("zones") or {},
+                            bbox=m.get("logo_bbox") or (0, 0, 0, 0),
+                            confidence=float(m.get("logo_confidence", 0.0) or 0.0),
                         ),
-                    )
-                    save_image(
-                        debug_root / f"page_{p:02d}_zone1_fields_zone.jpg",
-                        _draw_zone1_fields_band(img, m["zones"]["fields"]),
                     )
 
             # Dump full page metadata for debugging splits/logo confidence/template status.
@@ -302,10 +399,10 @@ def process_form(pdf_path: str, output_dir: str = "output", *, debug: bool = Fal
 
         # STEP 3: Extraction (multi-document)
         docs = _group_pages_by_document(page_meta)
+        page_meta_by_num: dict[int, dict[str, Any]] = {int(m.get("page_num", 0) or 0): m for m in (page_meta or [])}
         doc_results_meta: List[Dict[str, Any]] = []
         field_regions: List[ExtractedRegion] = []
         table_regions: List[ExtractedRegion] = []
-        dot_debug_summary: List[Dict[str, Any]] = []
         processed_pages: set[int] = set()
         table_page_times: List[float] = []
         table_pages_attempted: int = 0
@@ -322,92 +419,134 @@ def process_form(pdf_path: str, output_dir: str = "output", *, debug: bool = Fal
 
                 log.info("Processing document %d: pages=%s first_page=%d", int(did), [int(m["page_num"]) + 1 for m in doc_pages], first_idx + 1)
 
-                # Manual review flag: logo page but region templates didn't yield a fields band.
+                # TODO
+                # If region templates fail on a logo-detected first page:
+                # - DO NOT fall back to other template sets for fields zoning.
+                # - Skip fields extraction (fields band is undefined), BUT still attempt table extraction.
                 rt = first_meta.get("region_templates") or {}
-                if bool(first_meta.get("logo_detected", False)) and str(rt.get("status", "")) != "ok":
+                doc_templates_failed = bool(first_meta.get("logo_detected", False)) and str(rt.get("status", "")) != "ok"
+                if doc_templates_failed:
                     msg = (
                         f"Manual review needed: pdf={pdf_path} doc={int(did)} first_page={first_idx+1} "
-                        f"region_templates_status={rt.get('status')} used={rt.get('used_templates')}"
+                        f"region_templates_status={rt.get('status')} used={rt.get('used_templates')} "
+                        f"(fields extraction skipped; table extraction will still run)"
                     )
                     log.warning(msg)
                     manual_review.append(
                         {
                             "document_id": int(did),
                             "first_page": int(first_idx),
-                            "reason": "region_templates_failed",
+                            "reason": "region_templates_failed_fields_skipped",
                             "region_templates": rt,
                         }
                     )
 
                 # Fields (only on first page)
                 doc_field_regions: List[ExtractedRegion] = []
-                if bool(first_meta.get("has_fields", False)):
-                    field_zone = first_meta["zones"]["fields"]
-                    prefix = f"doc{int(did)}_p{int(first_idx)+1}_"
-                    fe = FieldExtractor(remove_dots=True)
-                    doc_field_regions = fe.extract_fields(pages[first_idx], field_zone, debug=debug, region_id_prefix=prefix)
-                    field_regions.extend(doc_field_regions)
-                    processed_pages.add(int(first_idx))
+                prefix = f"doc{int(did)}_p{int(first_idx)+1}_"
+                # NOTE: legacy dotted-line/dot detection has been removed from the main pipeline.
+                # We OCR a single "fields band" crop per document-first page.
+                img0 = pages[first_idx]
+                h0, w0 = img0.shape[:2]
+                rid = f"{prefix}fields_band"
 
-                    if debug_root is not None:
-                        dot_det = DotDetector()
-                        dotted = dot_det.detect_dotted_lines(pages[first_idx], field_zone)
-                        save_image(
-                            debug_root / f"page_{int(first_idx)+1:02d}_dots_detected.jpg",
-                            dot_det.visualize_detection(pages[first_idx], dotted, field_zone),
-                        )
-                        dot_debug_summary.append(
+                # Prefer region-template derived fields band when available.
+                zones0 = first_meta.get("zones") or {}
+                fy0, fy1 = (zones0.get("fields") or (0, 0))
+                try:
+                    fy0, fy1 = int(fy0), int(fy1)
+                except Exception:
+                    fy0, fy1 = (0, 0)
+
+                band_box: Box | None = None
+                band_source = "region_templates"
+                table_top_y: int | None = None
+                header_y1 = int((zones0.get("header") or (0, 0))[1] or 0)
+                try:
+                    lb = first_meta.get("logo_bbox") or (0, 0, 0, 0)
+                    logo_bottom = int(lb[1]) + int(lb[3])
+                except Exception:
+                    logo_bottom = 0
+
+                if int(fy1) > int(fy0) + 40:
+                    band_box = Box(x=0, y=int(fy0), w=int(w0), h=int(fy1 - fy0)).clamp(width=w0, height=h0)
+                else:
+                    # Fallback: crop from under logo/header down to just above the table.
+                    band_source = "fields_band_fallback"
+                    y0 = max(int(header_y1), int(logo_bottom)) + int(band_pad_px)
+                    td0 = TableDetector()
+                    try:
+                        tb = td0.detect_table_boundary(img0, (0, int(h0)))
+                        table_top_y = int(tb.y)
+                        y1 = int(table_top_y) - int(band_pad_px)
+                    except Exception as e:
+                        manual_review.append(
                             {
-                                "kind": "fields_first_page",
                                 "document_id": int(did),
-                                "page_num": int(first_idx),
-                                "zone": [int(field_zone[0]), int(field_zone[1])],
-                                "dotted_lines": int(len(dotted)),
+                                "first_page": int(first_idx),
+                                "reason": "fields_band_table_boundary_failed",
+                                "error": str(e),
                             }
                         )
-                        for r in doc_field_regions:
-                            save_image(debug_root / f"{r.region_id}_raw.jpg", r.raw_image)
-                            save_image(debug_root / f"{r.region_id}_preprocessed.jpg", r.image)
+                        y1 = 0
+                    if int(y1) > int(y0) + 40:
+                        band_box = Box(x=0, y=int(y0), w=int(w0), h=int(y1 - y0)).clamp(width=w0, height=h0)
+                    else:
+                        manual_review.append(
+                            {
+                                "document_id": int(did),
+                                "first_page": int(first_idx),
+                                "reason": "fields_band_ocr_fallback_skipped_invalid_band",
+                                "detail": {"y0": int(y0), "y1": int(y1), "header_y1": int(header_y1), "logo_bottom": int(logo_bottom)},
+                            }
+                        )
 
-                # Debug-only: run dot detection on every logo-detected page (using inferred fields band)
-                # and on every table page (restricted to the last-column ROI).
-                if debug_root is not None:
-                    dot_det = DotDetector()
-                    for doc_local_idx, m in enumerate(doc_pages, start=1):
-                        page_num = int(m.get("page_num", 0))
-                        img = pages[page_num]
+                if band_box is not None and int(band_box.w) > 0 and int(band_box.h) > 0:
+                    raw_band = img0[band_box.y : band_box.y2, band_box.x : band_box.x2].copy()
+                    if raw_band.size:
+                        # Light preprocessing: CLAHE + Otsu to help OCR across mixed print/handwriting.
+                        gray = cv2.cvtColor(raw_band, cv2.COLOR_BGR2GRAY)
+                        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+                        gray = clahe.apply(gray)
+                        _thr, bw = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+                        bw = cv2.fastNlMeansDenoising(bw, None, h=10, templateWindowSize=7, searchWindowSize=21)
 
-                        # (A) Pages with logo: run dot detection within the inferred fields band.
-                        if bool(m.get("logo_detected", False)):
-                            fz = (m.get("zones") or {}).get("fields") or (0, 0)
-                            try:
-                                y0, y1 = int(fz[0]), int(fz[1])
-                            except Exception:
-                                y0, y1 = 0, 0
-                            if y1 > y0:
-                                dotted = dot_det.detect_dotted_lines(img, (int(y0), int(y1)))
-                                save_image(
-                                    debug_root
-                                    / f"page_{page_num+1:02d}_doc_{int(did)+1:02d}_page_{int(doc_local_idx):02d}_fields_dots_detected.jpg",
-                                    dot_det.visualize_detection(img, dotted, (int(y0), int(y1))),
-                                )
-                                dot_debug_summary.append(
-                                    {
-                                        "kind": "fields_logo_page",
-                                        "document_id": int(did),
-                                        "page_num": int(page_num),
-                                        "doc_page_index": int(doc_local_idx),
-                                        "zone": [int(y0), int(y1)],
-                                        "dotted_lines": int(len(dotted)),
-                                        "region_templates_status": (m.get("region_templates") or {}).get("status"),
-                                    }
-                                )
+                        doc_field_regions = [
+                            ExtractedRegion(
+                                region_id=rid,
+                                bbox=band_box,
+                                image=bw,
+                                raw_image=raw_band,
+                                meta={
+                                    "kind": "fields_band",
+                                    "source": str(band_source),
+                                    "y0": int(band_box.y),
+                                    "y1": int(band_box.y2),
+                                    "table_top_y": (int(table_top_y) if table_top_y is not None else None),
+                                    "logo_bbox": list(first_meta.get("logo_bbox") or (0, 0, 0, 0)),
+                                    "header_y1": int(header_y1),
+                                },
+                            )
+                        ]
+                        field_regions.extend(doc_field_regions)
+                        processed_pages.add(int(first_idx))
+                        manual_review.append(
+                            {
+                                "document_id": int(did),
+                                "first_page": int(first_idx),
+                                "reason": "fields_band_ocr_used",
+                                "source": str(band_source),
+                                "bbox": [int(band_box.x), int(band_box.y), int(band_box.w), int(band_box.h)],
+                            }
+                        )
+                        pm = page_meta_by_num.get(int(first_idx))
+                        if isinstance(pm, dict):
+                            pm["fields_region_bbox"] = [int(band_box.x), int(band_box.y), int(band_box.w), int(band_box.h)]
+                            pm["fields_region_source"] = str(band_source)
 
                 # Tables (all pages in doc)
                 td = TableDetector()
                 te = TableExtractor(remove_grid=True)
-                target_col: Optional[Tuple[int, int]] = None
-                target_col_idx0: Optional[int] = None
                 row_offset = 0
                 doc_table_regions: List[ExtractedRegion] = []
 
@@ -446,69 +585,58 @@ def process_form(pdf_path: str, output_dir: str = "output", *, debug: bool = Fal
                     finally:
                         table_page_times.append(float(time.perf_counter() - t0_page))
 
-                    if bool(m.get("is_first_page", False)):
-                        target_col = struct.target_column
-                        target_col_idx0 = int(struct.target_column_index)
-                    elif target_col is not None and target_col_idx0 is not None:
-                        struct = TableStructure(
-                            bbox=struct.bbox,
-                            grid_horizontal=struct.grid_horizontal,
-                            grid_vertical=struct.grid_vertical,
-                            target_column=target_col,
-                            target_column_index=int(target_col_idx0),
-                            rows=struct.rows,
-                            cols=struct.cols,
-                        )
+                    # Persist per-page table/last-column bboxes into page metadata (even when not debugging).
+                    pm = page_meta_by_num.get(int(page_num))
+                    if isinstance(pm, dict):
+                        try:
+                            tb = getattr(struct, "bbox", None)
+                            if tb is not None:
+                                pm["table_bbox"] = [int(tb.x), int(tb.y), int(tb.w), int(tb.h)]
+                            x0, x1 = getattr(struct, "target_column", (0, 0))
+                            x0i, x1i = int(x0), int(x1)
+                            x0i, x1i = (min(x0i, x1i), max(x0i, x1i))
+                            if tb is not None and int(tb.h) > 0 and int(x1i) > int(x0i):
+                                pm["last_column_bbox"] = [int(x0i), int(tb.y), int(x1i - x0i), int(tb.h)]
+                            pm["last_column_index_0based"] = int(getattr(struct, "target_column_index", -1) or -1)
+                        except Exception:
+                            # Best effort; never break extraction for metadata.
+                            pass
+
+                    if debug_root is not None:
+                        # Save per-page last-column overlay (uses per-page target column).
+                        p = int(page_num) + 1
+                        try:
+                            doc_local = int([int(mm.get("page_num", 0)) for mm in doc_pages].index(int(page_num)) + 1)
+                        except Exception:
+                            doc_local = 1
+                        fn = f"page_{p:02d}_doc_{int(did)+1:02d}_page_{doc_local:02d}_last_column.jpg"
+                        save_image(debug_root / fn, _draw_last_column_overlay(img, struct))
+
+                        # Also add last-column overlay to the region-template debug image (first pages only).
+                        if bool(m.get("is_first_page", False)):
+                            z1 = m.get("zone1_template_search") or {}
+                            search_y = int(z1.get("y_end") or img.shape[0])
+                            search_x = int(z1.get("x_end") or img.shape[1])
+                            search_y = max(1, min(search_y, int(img.shape[0])))
+                            search_x = max(1, min(search_x, int(img.shape[1])))
+                            search_zone = (0, int(search_y))
+
+                            composed = _draw_last_column_overlay(img, struct)
+                            composed = zone_detector.visualize_zone1_template_hits(
+                                composed, m.get("zone1_template_hits") or [], search_zone, search_x
+                            )
+                            composed = _draw_zones(composed, m.get("zones") or {})
+                            composed = _draw_logo_overlay(
+                                composed,
+                                bbox=m.get("logo_bbox") or (0, 0, 0, 0),
+                                confidence=float(m.get("logo_confidence", 0.0) or 0.0),
+                            )
+                            rt_fn = f"page_{p:02d}_doc_{int(did)+1:02d}_page_{doc_local:02d}_region_templates_detected.jpg"
+                            save_image(debug_root / rt_fn, composed)
 
                     page_cells = te.extract_target_column_cells(img, struct, page_num, row_offset=row_offset, skip_header_rows=1)
                     doc_table_regions.extend(page_cells)
                     row_offset += len(page_cells)
-
-                    if debug_root is not None and page_cells:
-                        for r in page_cells[:12]:
-                            save_image(debug_root / f"{r.region_id}_raw.jpg", r.raw_image)
-                            save_image(debug_root / f"{r.region_id}_preprocessed.jpg", r.image)
-
-                    # Debug-only: dot detection within last-column ROI (for table pages).
-                    if debug_root is not None:
-                        try:
-                            x0, x1 = (int(struct.target_column[0]), int(struct.target_column[1]))
-                            y0, y1 = (int(struct.bbox.y), int(struct.bbox.y2))
-                            h, w = img.shape[:2]
-                            x0 = max(0, min(x0, w))
-                            x1 = max(0, min(x1, w))
-                            y0 = max(0, min(y0, h))
-                            y1 = max(0, min(y1, h))
-                            if x1 > x0 and y1 > y0:
-                                roi = img[y0:y1, x0:x1].copy()
-                                dotted = dot_det.detect_dotted_lines(roi, (0, int(roi.shape[0])))
-                                roi_overlay = dot_det.visualize_detection(roi, dotted, (0, int(roi.shape[0])))
-                                overlay = img.copy()
-                                overlay[y0:y1, x0:x1] = roi_overlay
-                                cv2.rectangle(overlay, (x0, y0), (x1, y1), (255, 0, 255), 4)
-                                # doc-local index for this page within the document (1-based)
-                                doc_local_idx = 1
-                                try:
-                                    doc_local_idx = int([int(mm.get("page_num", 0)) for mm in doc_pages].index(int(page_num)) + 1)
-                                except Exception:
-                                    doc_local_idx = 1
-                                save_image(
-                                    debug_root
-                                    / f"page_{page_num+1:02d}_doc_{int(did)+1:02d}_page_{int(doc_local_idx):02d}_table_lastcol_dots_detected.jpg",
-                                    overlay,
-                                )
-                                dot_debug_summary.append(
-                                    {
-                                        "kind": "table_lastcol",
-                                        "document_id": int(did),
-                                        "page_num": int(page_num),
-                                        "doc_page_index": int(doc_local_idx),
-                                        "roi": [int(x0), int(y0), int(x1 - x0), int(y1 - y0)],
-                                        "dotted_lines": int(len(dotted)),
-                                    }
-                                )
-                        except Exception:
-                            pass
 
                 table_regions.extend(doc_table_regions)
 
@@ -519,15 +647,21 @@ def process_form(pdf_path: str, output_dir: str = "output", *, debug: bool = Fal
                         "first_page": int(first_idx),
                         "logo_detected": bool(first_meta.get("logo_detected", False)),
                         "logo_confidence": float(first_meta.get("logo_confidence", 0.0) or 0.0),
-                        "needs_manual_review": bool(
-                            bool(first_meta.get("logo_detected", False))
-                            and str((first_meta.get("region_templates") or {}).get("status", "")) != "ok"
-                        ),
+                        "needs_manual_review": bool(doc_templates_failed),
+                        "status": "ok",
+                        "warnings": (["region_templates_failed_fields_skipped"] if bool(doc_templates_failed) else []),
                         "extractions": {"fields": int(len(doc_field_regions)), "table_column_3": int(len(doc_table_regions))},
                     }
                 )
 
         timings["step3_extract_all_documents_s"] = float(t_extract.dt or 0.0)
+
+        # If debugging, overwrite page_meta.json with extraction-enriched bboxes.
+        if debug_root is not None:
+            try:
+                save_json(debug_root / "page_meta.json", page_meta)
+            except Exception:
+                pass
 
         # STEP 4: Batch OCR
         with Timer("ocr") as t:
@@ -543,6 +677,8 @@ def process_form(pdf_path: str, output_dir: str = "output", *, debug: bool = Fal
             docs = _group_pages_by_document(page_meta)
             validator = Validator()
             documents_out: List[Dict[str, Any]] = []
+            doc_status_by_id: Dict[int, str] = {int(m.get("document_id", 0)): str(m.get("status", "ok")) for m in (doc_results_meta or [])}
+            doc_needs_review_by_id: Dict[int, bool] = {int(m.get("document_id", 0)): bool(m.get("needs_manual_review", False)) for m in (doc_results_meta or [])}
 
             # Build fast lookups by page for region assignment
             fields_by_doc: Dict[int, List[ExtractedRegion]] = {}
@@ -567,6 +703,19 @@ def process_form(pdf_path: str, output_dir: str = "output", *, debug: bool = Fal
                 f_regs = fields_by_doc.get(int(did), [])
                 t_regs = tables_by_doc.get(int(did), [])
 
+                if str(doc_status_by_id.get(int(did), "ok")) != "ok":
+                    # Skip validation/structuring for failed docs; keep a clear marker in output.
+                    documents_out.append(
+                        {
+                            "document_id": int(did),
+                            "pages": [int(m["page_num"]) for m in doc_pages],
+                            "first_page": int(first_idx),
+                            "status": "failed",
+                            "error": "region_templates_failed_skip_document",
+                        }
+                    )
+                    continue
+
                 structured_doc = structure_results(f_regs, t_regs, ocr_results)
                 validated_doc = validator.validate_results(structured_doc)
                 documents_out.append(
@@ -574,6 +723,7 @@ def process_form(pdf_path: str, output_dir: str = "output", *, debug: bool = Fal
                         "document_id": int(did),
                         "pages": [int(m["page_num"]) for m in doc_pages],
                         "first_page": int(first_idx),
+                        "needs_manual_review": bool(doc_needs_review_by_id.get(int(did), False)),
                         **validated_doc,
                     }
                 )
@@ -612,6 +762,19 @@ def process_form(pdf_path: str, output_dir: str = "output", *, debug: bool = Fal
                 "timings": {k: round(float(v), 3) for k, v in timings.items()},
                 "step2_zone_detection_detail": step2_detail,
                 "manual_review": manual_review,
+                "page_layout": [
+                    {
+                        "page_num": int(m.get("page_num", 0) or 0),
+                        "document_id": int(m.get("document_id", 0) or 0),
+                        "is_first_page": bool(m.get("is_first_page", False)),
+                        "fields_region_bbox": list(m.get("fields_region_bbox") or [0, 0, 0, 0]),
+                        "fields_region_source": str(m.get("fields_region_source", "none") or "none"),
+                        "table_bbox": list(m.get("table_bbox") or [0, 0, 0, 0]),
+                        "last_column_bbox": list(m.get("last_column_bbox") or [0, 0, 0, 0]),
+                        "last_column_index_0based": int(m.get("last_column_index_0based", -1) or -1),
+                    }
+                    for m in (page_meta or [])
+                ],
                 "extractions": {
                     "fields": len(field_regions),
                     "table_column_3": len(table_regions),
@@ -632,7 +795,6 @@ def process_form(pdf_path: str, output_dir: str = "output", *, debug: bool = Fal
         if debug_root is not None:
             save_json(debug_root / "timing_breakdown.json", timings)
             save_json(debug_root / "ocr_results.json", {k: v.__dict__ for k, v in ocr_results.items()})
-            save_json(debug_root / "dot_detection_summary.json", dot_debug_summary)
 
         log.info("Step 1: Loaded %d pages (%.3fs)", len(pages), timings.get("step1_load_pdf_s", 0.0))
         log.info(
